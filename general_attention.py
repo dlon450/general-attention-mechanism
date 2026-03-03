@@ -191,6 +191,8 @@ class GibbsConfig:
     init_p: float = 0.5
     logsumexp_eps: float = 1e-6
     repulsion_lambda: float = 0.1
+    # Use straight-through gradients through Bernoulli decisions so Q/K can train.
+    straight_through: bool = True
 
 def _gibbs_sample_subsets(
     q: torch.Tensor,     # (B, Lq, d_qk)
@@ -230,6 +232,7 @@ def _gibbs_sample_subsets(
     if cfg.init == "empty":
         mask = torch.zeros((n_chains, L), device=device, dtype=torch.bool)
         count = torch.zeros((n_chains,), device=device, dtype=torch.int32)
+        count_f = torch.zeros((n_chains,), device=device, dtype=torch.float32)
         sum_v = torch.zeros((n_chains, d_v), device=device, dtype=torch.float32)
         sum_k = torch.zeros((n_chains, d_qk), device=device, dtype=torch.float32) if needs_sum_k else None
         sum_w = torch.zeros((n_chains,), device=device, dtype=torch.float32) if needs_sum_w else None
@@ -238,6 +241,7 @@ def _gibbs_sample_subsets(
             raise ValueError("init='random' not supported for logsumexp (needs per-query weights)")
         mask = (torch.rand((n_chains, L), device=device) < float(cfg.init_p))
         count = mask.sum(dim=1, dtype=torch.int32)
+        count_f = count.to(torch.float32)
         sum_v = torch.zeros((n_chains, d_v), device=device, dtype=torch.float32)
         sum_k = torch.zeros((n_chains, d_qk), device=device, dtype=torch.float32) if needs_sum_k else None
         sum_w = None
@@ -297,22 +301,32 @@ def _gibbs_sample_subsets(
 
         p_add = torch.sigmoid(beta * delta)
         z = torch.rand((n_chains,), device=device)
-        new_in = z <= p_add
+        new_in_hard = z <= p_add
 
-        if torch.any(new_in != old_in):
-            sign = (new_in.to(torch.float32) - old_in.to(torch.float32))
-            mask[chain_ids, vidx] = new_in
-            count = count + sign.to(torch.int32)
-            sum_v = sum_v + sign.unsqueeze(-1) * vv
-            if f2_type in ("dot_repulsion", "neural_mlp"):
-                sum_k = sum_k + sign.unsqueeze(-1) * kv
-            elif f2_type == "logsumexp":
-                sum_w = sum_w + sign * torch.exp(a_v)
+        old_f = old_in.to(torch.float32)
+        new_f_hard = new_in_hard.to(torch.float32)
+        sign_hard = new_f_hard - old_f
+
+        # Forward path stays hard Bernoulli; backward path follows p_add.
+        if cfg.straight_through:
+            new_f = new_f_hard.detach() - p_add.detach() + p_add
+            sign = new_f - old_f
+        else:
+            sign = sign_hard
+
+        mask[chain_ids, vidx] = new_in_hard
+        count = count + sign_hard.to(torch.int32)
+        count_f = count_f + sign
+        sum_v = sum_v + sign.unsqueeze(-1) * vv
+        if f2_type in ("dot_repulsion", "neural_mlp"):
+            sum_k = sum_k + sign_hard.unsqueeze(-1) * kv
+        elif f2_type == "logsumexp":
+            sum_w = sum_w + sign_hard * torch.exp(a_v)
 
     if isinstance(f1, ConcatMLPAggregator):
-        out_chain = f1.forward_subset(v=v_f, batch_idx=batch_idx, mask=mask, count=count)  # (n_chains, d_v)
+        out_chain = f1.forward_subset(v=v_f, batch_idx=batch_idx, mask=mask, count=count_f)  # (n_chains, d_v)
     else:
-        out_chain = f1(sum_v, count.to(sum_v.dtype))  # (n_chains, d_v)
+        out_chain = f1(sum_v, count_f)  # (n_chains, d_v)
     out = out_chain.view(B, Lq, cfg.runs, d_v).mean(dim=2)
     return out
 
