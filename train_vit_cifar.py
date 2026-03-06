@@ -635,7 +635,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--general-d-qk", type=int, default=None)
     parser.add_argument(
         "--f1-type",
-        choices=["mean", "mlp_mean", "mlp_concat"],
+        choices=["mean", "mlp_mean", "mlp_concat", "transformer"],
         default="mean",
     )
     parser.add_argument(
@@ -651,8 +651,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gibbs-logsumexp-eps", type=float, default=1e-6)
     parser.add_argument("--gibbs-repulsion-lambda", type=float, default=0.1)
     parser.add_argument("--query-chunk-size", type=int, default=128)
-    parser.add_argument("--f1-concat-max-set-size", type=int, default=8)
-    parser.add_argument("--f1-concat-hidden", type=int, default=128)
+    parser.add_argument(
+        "--f1-concat-max-set-size",
+        type=int,
+        default=8,
+        help="Max selected subset tokens used by f1=mlp_concat or f1=transformer.",
+    )
+    parser.add_argument(
+        "--f1-concat-hidden",
+        type=int,
+        default=128,
+        help="Hidden width used by f1=mlp_concat or f1=transformer.",
+    )
     parser.add_argument("--f2-neural-hidden", type=int, default=128)
     parser.add_argument("--general-bias", action="store_true")
     parser.add_argument(

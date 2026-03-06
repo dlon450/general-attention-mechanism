@@ -15,10 +15,11 @@ We provide efficient F2 instantiations with O(d) incremental Δ updates:
   3) dot_repulsion: F(S) = Σ_{i∈S} a_i - λ Σ_{i<j∈S} <k_i,k_j>/√d
   4) neural_mlp:    F(S) = MLP([q, mean_k(S), log(1+|S|)])
 
-and F1 instantiations operating on sufficient stats:
+and F1 instantiations:
   - mean
   - mlp_mean
   - mlp_concat (explicit subset members, padded/truncated)
+  - transformer (tiny Transformer over explicit subset members)
 """
 from __future__ import annotations
 
@@ -29,7 +30,7 @@ import torch
 import torch.nn as nn
 
 F2Type = Literal["modular_dot", "logsumexp", "dot_repulsion", "neural_mlp"]
-F1Type = Literal["mean", "mlp_mean", "mlp_concat"]
+F1Type = Literal["mean", "mlp_mean", "mlp_concat", "transformer"]
 InitType = Literal["empty", "random"]
 
 class SetAggregator(nn.Module):
@@ -140,6 +141,124 @@ class ConcatMLPAggregator(SetAggregator):
         x = torch.cat([flat, log_count], dim=-1)
         return self.mlp(x)
 
+
+class TransformerSubsetAggregator(SetAggregator):
+    """Lightweight Transformer F1 over explicit subset members.
+
+    Selects up to `max_set_size` members from S in index order, runs a tiny
+    Transformer encoder over the packed sequence, masked-mean pools valid
+    positions, appends log(1+|S|), and projects back to d_v.
+    """
+
+    def __init__(
+        self,
+        d_v: int,
+        max_set_size: int = 8,
+        hidden: int = 128,
+        num_layers: int = 1,
+        num_heads: int = 4,
+        dropout: float = 0.0,
+        eps: float = 1e-8,
+    ):
+        super().__init__()
+        self.d_v = int(d_v)
+        self.max_set_size = int(max_set_size)
+        if self.max_set_size <= 0:
+            raise ValueError("f1 transformer max_set_size must be > 0")
+        if int(num_layers) <= 0:
+            raise ValueError("f1 transformer num_layers must be > 0")
+
+        n_heads = max(1, min(int(num_heads), self.d_v))
+        while self.d_v % n_heads != 0 and n_heads > 1:
+            n_heads -= 1
+        self.num_heads = n_heads
+        self.eps = float(eps)
+
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.max_set_size, self.d_v))
+        ff_dim = max(int(hidden), self.d_v)
+        layer = nn.TransformerEncoderLayer(
+            d_model=self.d_v,
+            nhead=self.num_heads,
+            dim_feedforward=ff_dim,
+            dropout=float(dropout),
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(layer, num_layers=int(num_layers))
+        self.out = nn.Sequential(
+            nn.Linear(self.d_v + 1, ff_dim),
+            nn.GELU(),
+            nn.Linear(ff_dim, self.d_v),
+        )
+
+    def forward(self, sum_v: torch.Tensor, count: torch.Tensor) -> torch.Tensor:
+        raise RuntimeError("TransformerSubsetAggregator requires subset masks; call forward_subset")
+
+    def forward_subset(
+        self,
+        v: torch.Tensor,          # (B, L, d_v)
+        batch_idx: torch.Tensor,  # (n_chains,)
+        mask: torch.Tensor,       # (n_chains, L) bool
+        count: torch.Tensor,      # (n_chains,)
+    ) -> torch.Tensor:
+        n_chains, L = mask.shape
+        chain_v = v[batch_idx]  # (n_chains, L, d_v)
+        d_v = chain_v.shape[-1]
+        if d_v != self.d_v:
+            raise ValueError("TransformerSubsetAggregator d_v mismatch")
+
+        k_keep = min(self.max_set_size, L)
+        if k_keep > 0:
+            pos = torch.arange(L, device=mask.device, dtype=torch.float32)
+            scores = mask.to(torch.float32) * (float(L) - pos).unsqueeze(0)
+            top_scores, top_idx = torch.topk(scores, k=k_keep, dim=1)
+            picked = top_scores > 0
+
+            sentinel = torch.full_like(top_idx, L)
+            sortable = torch.where(picked, top_idx, sentinel)
+            sortable, order = torch.sort(sortable, dim=1)
+            picked = torch.gather(picked, 1, order)
+
+            safe_idx = torch.where(picked, sortable, torch.zeros_like(sortable))
+            gather_idx = safe_idx.unsqueeze(-1).expand(-1, -1, d_v)
+            packed = torch.gather(chain_v, 1, gather_idx)
+            packed = packed * picked.unsqueeze(-1).to(packed.dtype)
+        else:
+            packed = chain_v.new_zeros((n_chains, 0, d_v))
+            picked = torch.zeros((n_chains, 0), device=mask.device, dtype=torch.bool)
+
+        if k_keep < self.max_set_size:
+            pad = chain_v.new_zeros((n_chains, self.max_set_size - k_keep, d_v))
+            packed = torch.cat([packed, pad], dim=1)
+            pad_mask = torch.zeros(
+                (n_chains, self.max_set_size - k_keep), device=mask.device, dtype=torch.bool
+            )
+            picked = torch.cat([picked, pad_mask], dim=1)
+
+        x = packed + self.pos_embed[:, : self.max_set_size, :].to(packed.dtype)
+        key_padding_mask = ~picked
+
+        # Avoid fully-masked rows: unmask one token, then zero it out in pooling.
+        empty = key_padding_mask.all(dim=1)
+        if empty.any():
+            key_padding_mask = key_padding_mask.clone()
+            key_padding_mask[empty, 0] = False
+
+        encoded = self.encoder(x, src_key_padding_mask=key_padding_mask)
+        picked_f = picked.to(encoded.dtype)
+        denom = picked_f.sum(dim=1, keepdim=True).clamp_min(self.eps)
+        pooled = (encoded * picked_f.unsqueeze(-1)).sum(dim=1) / denom
+        pooled = torch.where(
+            picked.any(dim=1, keepdim=True),
+            pooled,
+            torch.zeros_like(pooled),
+        )
+        log_count = torch.log1p(count.to(chain_v.dtype)).unsqueeze(-1)
+        feat = torch.cat([pooled, log_count], dim=-1)
+        return self.out(feat)
+
+
 def build_f1(
     f1_type: F1Type,
     d_v: int,
@@ -153,6 +272,12 @@ def build_f1(
         return MLPMeanAggregator(d_v=d_v)
     if f1_type == "mlp_concat":
         return ConcatMLPAggregator(
+            d_v=d_v,
+            max_set_size=concat_max_set_size,
+            hidden=concat_hidden,
+        )
+    if f1_type == "transformer":
+        return TransformerSubsetAggregator(
             d_v=d_v,
             max_set_size=concat_max_set_size,
             hidden=concat_hidden,
@@ -340,7 +465,7 @@ def _gibbs_sample_subsets(
         elif f2_type == "logsumexp":
             sum_w = sum_w + sign_hard * torch.exp(a_v)
 
-    if isinstance(f1, ConcatMLPAggregator):
+    if isinstance(f1, (ConcatMLPAggregator, TransformerSubsetAggregator)):
         out_chain = f1.forward_subset(v=v_f, batch_idx=batch_idx, mask=mask, count=count_f)  # (n_chains, d_v)
     else:
         out_chain = f1(sum_v, count_f)  # (n_chains, d_v)
