@@ -57,17 +57,39 @@ def _pack_selected_members(
     order after tie-breaking.
     """
 
-    n_chains, L, d = chain_x.shape
-    keep = min(int(max_set_size), int(L))
+    n_chains, _, d = chain_x.shape
+    safe_idx, picked = _select_subset_indices(
+        mask=mask, max_set_size=max_set_size, rank_scores=rank_scores
+    )
+    keep = safe_idx.shape[1]
     if keep <= 0:
         packed = chain_x.new_zeros((n_chains, 0, d))
-        picked = torch.zeros((n_chains, 0), device=mask.device, dtype=torch.bool)
         return packed, picked
 
+    gather_idx = safe_idx.unsqueeze(-1).expand(-1, -1, d)
+    packed = torch.gather(chain_x, 1, gather_idx)
+    packed = packed * picked.unsqueeze(-1).to(packed.dtype)
+    return packed, picked
+
+
+def _select_subset_indices(
+    mask: torch.Tensor,          # (n_chains, L) bool
+    max_set_size: int,
+    rank_scores: Optional[torch.Tensor] = None,  # (n_chains, L)
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select up to max_set_size subset indices by rank_scores among mask=True."""
+
+    n_chains, L = mask.shape
+    keep = min(int(max_set_size), int(L))
+    if keep <= 0:
+        safe_idx = torch.zeros((n_chains, 0), device=mask.device, dtype=torch.long)
+        picked = torch.zeros((n_chains, 0), device=mask.device, dtype=torch.bool)
+        return safe_idx, picked
+
     if rank_scores is None:
-        base_scores = mask.to(chain_x.dtype)
+        base_scores = mask.to(torch.float32)
     else:
-        base_scores = rank_scores.to(chain_x.dtype)
+        base_scores = rank_scores.to(torch.float32)
     neg_inf = torch.finfo(base_scores.dtype).min
     masked_scores = torch.where(mask, base_scores, torch.full_like(base_scores, neg_inf))
     _, top_idx = torch.topk(masked_scores, k=keep, dim=1)
@@ -78,12 +100,8 @@ def _pack_selected_members(
     sortable = torch.where(picked, top_idx, sentinel)
     sortable, order = torch.sort(sortable, dim=1)
     picked = torch.gather(picked, 1, order)
-
     safe_idx = torch.where(picked, sortable, torch.zeros_like(sortable))
-    gather_idx = safe_idx.unsqueeze(-1).expand(-1, -1, d)
-    packed = torch.gather(chain_x, 1, gather_idx)
-    packed = packed * picked.unsqueeze(-1).to(packed.dtype)
-    return packed, picked
+    return safe_idx, picked
 
 
 class MeanAggregator(SetAggregator):
@@ -328,26 +346,29 @@ class NeuralMLPF2(nn.Module):
     def _pack_subset_keys(
         self,
         k: torch.Tensor,          # (B, L, d_qk)
-        q: torch.Tensor,          # (n_chains, d_qk)
         batch_idx: torch.Tensor,  # (n_chains,)
         mask: torch.Tensor,       # (n_chains, L) bool
+        rank_scores: Optional[torch.Tensor] = None,  # (n_chains, L)
     ) -> torch.Tensor:
-        chain_k = k[batch_idx]  # (n_chains, L, d_qk)
-        d_qk = chain_k.shape[-1]
+        d_qk = k.shape[-1]
         if d_qk != self.d_qk:
             raise ValueError("NeuralMLPF2 d_qk mismatch")
 
-        score_scale = 1.0 / math.sqrt(d_qk)
-        rank_scores = (chain_k * q.unsqueeze(1)).sum(dim=-1) * score_scale
-        packed, _ = _pack_selected_members(
-            chain_x=chain_k,
+        safe_idx, picked = _select_subset_indices(
             mask=mask,
             max_set_size=self.max_set_size,
             rank_scores=rank_scores,
         )
-        n_chains, keep, _ = packed.shape
+        n_chains, keep = safe_idx.shape
+        if keep > 0:
+            gather_batch = batch_idx.unsqueeze(1).expand(-1, keep)
+            packed = k[gather_batch, safe_idx]  # (n_chains, keep, d_qk)
+            packed = packed * picked.unsqueeze(-1).to(packed.dtype)
+        else:
+            packed = k.new_zeros((n_chains, 0, d_qk))
+
         if keep < self.max_set_size:
-            pad = chain_k.new_zeros((n_chains, self.max_set_size - keep, d_qk))
+            pad = k.new_zeros((n_chains, self.max_set_size - keep, d_qk))
             packed = torch.cat([packed, pad], dim=1)
 
         return packed.reshape(n_chains, -1)
@@ -359,8 +380,14 @@ class NeuralMLPF2(nn.Module):
         batch_idx: torch.Tensor,  # (n_chains,)
         mask: torch.Tensor,       # (n_chains, L) bool
         count: torch.Tensor,      # (n_chains,)
+        rank_scores: Optional[torch.Tensor] = None,  # (n_chains, L)
     ) -> torch.Tensor:
-        packed = self._pack_subset_keys(k=k, q=q, batch_idx=batch_idx, mask=mask)
+        packed = self._pack_subset_keys(
+            k=k,
+            batch_idx=batch_idx,
+            mask=mask,
+            rank_scores=rank_scores,
+        )
         log_count = torch.log1p(count.to(q.dtype)).unsqueeze(-1)
         feat = torch.cat([q, packed.to(q.dtype), log_count], dim=-1)
         return self.mlp(feat).squeeze(-1)
@@ -425,6 +452,9 @@ def _gibbs_sample_subsets(
 
     batch_for_query = torch.arange(B, device=device).repeat_interleave(Lq)
     batch_idx = batch_for_query.repeat_interleave(cfg.runs)
+    rank_scores_rep = torch.matmul(q_f, k_f.transpose(1, 2)) * scale  # (B, Lq, L)
+    rank_scores_rep = rank_scores_rep.reshape(n_queries, L)
+    rank_scores_rep = rank_scores_rep.repeat_interleave(cfg.runs, dim=0)
 
     # --- init state ---
     if cfg.init == "empty":
@@ -494,10 +524,20 @@ def _gibbs_sample_subsets(
             count_excl = count - old_in.to(count.dtype)
             count_add = count_excl + 1
             e_excl = f2_neural.forward_subset(
-                q=q_rep, k=k_f, batch_idx=batch_idx, mask=mask_excl, count=count_excl
+                q=q_rep,
+                k=k_f,
+                batch_idx=batch_idx,
+                mask=mask_excl,
+                count=count_excl,
+                rank_scores=rank_scores_rep,
             )
             e_add = f2_neural.forward_subset(
-                q=q_rep, k=k_f, batch_idx=batch_idx, mask=mask_add, count=count_add
+                q=q_rep,
+                k=k_f,
+                batch_idx=batch_idx,
+                mask=mask_add,
+                count=count_add,
+                rank_scores=rank_scores_rep,
             )
             delta = e_add - e_excl
         else:
@@ -537,13 +577,12 @@ def _gibbs_sample_subsets(
             sum_w = sum_w + state_sign * torch.exp(a_v)
 
     if isinstance(f1, (ConcatMLPAggregator, TransformerSubsetAggregator)):
-        rank_scores = (k_f[batch_idx] * q_rep.unsqueeze(1)).sum(dim=-1) * scale
         out_chain = f1.forward_subset(
             v=v_f,
             batch_idx=batch_idx,
             mask=mask,
             count=count_f,
-            rank_scores=rank_scores,
+            rank_scores=rank_scores_rep,
         )  # (n_chains, d_v)
     else:
         out_chain = f1(sum_v, count_f)  # (n_chains, d_v)
