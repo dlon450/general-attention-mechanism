@@ -33,6 +33,7 @@ F2Type = Literal["modular_dot", "logsumexp", "dot_repulsion", "neural_mlp"]
 F1Type = Literal["mean", "mlp_mean", "mlp_concat", "transformer"]
 InitType = Literal["empty", "random"]
 STGradientMode = Literal["partial", "consistent"]
+F1QueryMode = Literal["none", "replace", "add"]
 
 class SetAggregator(nn.Module):
     """Base class for F1(S).
@@ -102,6 +103,36 @@ def _select_subset_indices(
     picked = torch.gather(picked, 1, order)
     safe_idx = torch.where(picked, sortable, torch.zeros_like(sortable))
     return safe_idx, picked
+
+
+def _query_conditioned_subset_pool(
+    rank_scores: torch.Tensor,   # (n_chains, L)
+    v: torch.Tensor,             # (B, L, d_v)
+    batch_idx: torch.Tensor,     # (n_chains,)
+    mask: torch.Tensor,          # (n_chains, L)
+    max_set_size: int,
+) -> torch.Tensor:
+    """Restricted query-conditioned pooling over selected subset members."""
+
+    safe_idx, picked = _select_subset_indices(
+        mask=mask, max_set_size=max_set_size, rank_scores=rank_scores
+    )
+    n_chains, keep = safe_idx.shape
+    d_v = v.shape[-1]
+    if keep <= 0:
+        return v.new_zeros((n_chains, d_v))
+
+    gather_batch = batch_idx.unsqueeze(1).expand(-1, keep)
+    sel_v = v[gather_batch, safe_idx]  # (n_chains, keep, d_v)
+    sel_scores = torch.gather(rank_scores, 1, safe_idx)
+    neg_inf = torch.finfo(sel_scores.dtype).min
+    sel_scores = torch.where(picked, sel_scores, torch.full_like(sel_scores, neg_inf))
+    attn = torch.softmax(sel_scores, dim=1)
+    attn = torch.where(picked, attn, torch.zeros_like(attn))
+    non_empty = picked.any(dim=1, keepdim=True)
+    attn = torch.where(non_empty, attn, torch.zeros_like(attn))
+    pooled = (attn.unsqueeze(-1).to(sel_v.dtype) * sel_v).sum(dim=1)
+    return pooled
 
 
 class MeanAggregator(SetAggregator):
@@ -426,6 +457,8 @@ def _gibbs_sample_subsets(
     f1: SetAggregator,
     f2_neural: Optional[NeuralMLPF2] = None,
     tau_fn: Optional[QueryTau] = None,
+    f1_query_mode: F1QueryMode = "none",
+    f1_query_max_set_size: int = 8,
 ) -> torch.Tensor:
     if cfg.beta <= 0: raise ValueError("beta must be > 0")
     if cfg.gibbs_steps <= 0: raise ValueError("gibbs_steps must be > 0")
@@ -436,9 +469,14 @@ def _gibbs_sample_subsets(
     _, Lv, d_v = v.shape
     if L != Lv: raise ValueError("k/v length mismatch")
     if d_qk != d_qk2: raise ValueError("q/k dim mismatch")
+    if f1_query_mode not in ("none", "replace", "add"):
+        raise ValueError("f1_query_mode must be one of: none, replace, add")
+    if int(f1_query_max_set_size) <= 0:
+        raise ValueError("f1_query_max_set_size must be > 0")
 
     device = q.device
-    q_f, k_f, v_f = q.float(), k.float(), v.float()
+    work_dtype = q.dtype if q.is_floating_point() else torch.float32
+    q_f, k_f, v_f = q.to(work_dtype), k.to(work_dtype), v.to(work_dtype)
     scale = 1.0 / math.sqrt(d_qk)
     needs_sum_k = f2_type == "dot_repulsion"
     needs_sum_w = f2_type == "logsumexp"
@@ -460,25 +498,25 @@ def _gibbs_sample_subsets(
     if cfg.init == "empty":
         mask = torch.zeros((n_chains, L), device=device, dtype=torch.bool)
         count = torch.zeros((n_chains,), device=device, dtype=torch.int32)
-        count_f = torch.zeros((n_chains,), device=device, dtype=torch.float32)
-        sum_v = torch.zeros((n_chains, d_v), device=device, dtype=torch.float32)
-        sum_k = torch.zeros((n_chains, d_qk), device=device, dtype=torch.float32) if needs_sum_k else None
-        sum_w = torch.zeros((n_chains,), device=device, dtype=torch.float32) if needs_sum_w else None
+        count_f = torch.zeros((n_chains,), device=device, dtype=work_dtype)
+        sum_v = torch.zeros((n_chains, d_v), device=device, dtype=work_dtype)
+        sum_k = torch.zeros((n_chains, d_qk), device=device, dtype=work_dtype) if needs_sum_k else None
+        sum_w = torch.zeros((n_chains,), device=device, dtype=work_dtype) if needs_sum_w else None
     elif cfg.init == "random":
         if f2_type == "logsumexp":
             raise ValueError("init='random' not supported for logsumexp (needs per-query weights)")
         mask = (torch.rand((n_chains, L), device=device) < float(cfg.init_p))
         count = mask.sum(dim=1, dtype=torch.int32)
-        count_f = count.to(torch.float32)
-        sum_v = torch.zeros((n_chains, d_v), device=device, dtype=torch.float32)
-        sum_k = torch.zeros((n_chains, d_qk), device=device, dtype=torch.float32) if needs_sum_k else None
+        count_f = count.to(work_dtype)
+        sum_v = torch.zeros((n_chains, d_v), device=device, dtype=work_dtype)
+        sum_k = torch.zeros((n_chains, d_qk), device=device, dtype=work_dtype) if needs_sum_k else None
         sum_w = None
 
         chains_per_batch = Lq * cfg.runs
         for b in range(B):
             start = b * chains_per_batch
             end = (b + 1) * chains_per_batch
-            m_b = mask[start:end].to(torch.float32)
+            m_b = mask[start:end].to(work_dtype)
             sum_v[start:end] = m_b @ v_f[b]
             if sum_k is not None:
                 sum_k[start:end] = m_b @ k_f[b]
@@ -551,8 +589,8 @@ def _gibbs_sample_subsets(
         z = torch.rand((n_chains,), device=device)
         new_in_hard = z <= p_add
 
-        old_f = old_in.to(torch.float32)
-        new_f_hard = new_in_hard.to(torch.float32)
+        old_f = old_in.to(work_dtype)
+        new_f_hard = new_in_hard.to(work_dtype)
         sign_hard = new_f_hard - old_f
 
         # Forward path stays hard Bernoulli; backward path follows p_add.
@@ -576,7 +614,10 @@ def _gibbs_sample_subsets(
         elif f2_type == "logsumexp":
             sum_w = sum_w + state_sign * torch.exp(a_v)
 
-    if isinstance(f1, (ConcatMLPAggregator, TransformerSubsetAggregator)):
+    out_chain: Optional[torch.Tensor]
+    if f1_query_mode == "replace":
+        out_chain = None
+    elif isinstance(f1, (ConcatMLPAggregator, TransformerSubsetAggregator)):
         out_chain = f1.forward_subset(
             v=v_f,
             batch_idx=batch_idx,
@@ -586,6 +627,22 @@ def _gibbs_sample_subsets(
         )  # (n_chains, d_v)
     else:
         out_chain = f1(sum_v, count_f)  # (n_chains, d_v)
+
+    if f1_query_mode != "none":
+        q_ctx = _query_conditioned_subset_pool(
+            rank_scores=rank_scores_rep,
+            v=v_f,
+            batch_idx=batch_idx,
+            mask=mask,
+            max_set_size=f1_query_max_set_size,
+        )
+        if f1_query_mode == "replace":
+            out_chain = q_ctx
+        else:
+            assert out_chain is not None
+            out_chain = out_chain + q_ctx
+    else:
+        assert out_chain is not None
     out = out_chain.view(B, Lq, cfg.runs, d_v).mean(dim=2)
     return out
 
@@ -610,6 +667,7 @@ class GeneralAttention(nn.Module):
         f1_concat_max_set_size: int = 8,
         f1_concat_hidden: int = 128,
         f2_neural_hidden: int = 128,
+        f1_query_mode: F1QueryMode = "none",
     ):
         super().__init__()
         self.d_model = int(d_model)
@@ -638,6 +696,12 @@ class GeneralAttention(nn.Module):
         )
         self.tau_fn = QueryTau(self.d_qk, init_value=tau_init) if use_learned_tau else None
         self.cfg = cfg if cfg is not None else GibbsConfig()
+        self.f1_concat_max_set_size = int(f1_concat_max_set_size)
+        if self.f1_concat_max_set_size <= 0:
+            raise ValueError("f1_concat_max_set_size must be > 0")
+        if f1_query_mode not in ("none", "replace", "add"):
+            raise ValueError("f1_query_mode must be one of: none, replace, add")
+        self.f1_query_mode = f1_query_mode
 
         self.query_chunk_size = int(query_chunk_size)
         if self.query_chunk_size <= 0:
@@ -670,6 +734,8 @@ class GeneralAttention(nn.Module):
                 f1=self.f1,
                 f2_neural=self.f2_neural,
                 tau_fn=self.tau_fn,
+                f1_query_mode=self.f1_query_mode,
+                f1_query_max_set_size=self.f1_concat_max_set_size,
             )
             outs.append(out_chunk)
         y = torch.cat(outs, dim=1)

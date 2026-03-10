@@ -113,6 +113,7 @@ class GeneralSelfAttention(nn.Module):
         cfg: GibbsConfig,
         f1_type: str,
         f2_type: str,
+        f1_query_mode: str,
         query_chunk_size: int,
         f1_concat_max_set_size: int,
         f1_concat_hidden: int,
@@ -145,6 +146,7 @@ class GeneralSelfAttention(nn.Module):
                     d_v=self.head_dim,
                     f2_type=f2_type,  # type: ignore[arg-type]
                     f1_type=f1_type,  # type: ignore[arg-type]
+                    f1_query_mode=f1_query_mode,  # type: ignore[arg-type]
                     cfg=cfg,
                     query_chunk_size=query_chunk_size,
                     bias=bias,
@@ -199,6 +201,7 @@ class TransformerBlock(nn.Module):
         general_d_qk: Optional[int],
         f1_type: str,
         f2_type: str,
+        f1_query_mode: str,
         query_chunk_size: int,
         f1_concat_max_set_size: int,
         f1_concat_hidden: int,
@@ -219,6 +222,7 @@ class TransformerBlock(nn.Module):
                 cfg=general_cfg,
                 f1_type=f1_type,
                 f2_type=f2_type,
+                f1_query_mode=f1_query_mode,
                 query_chunk_size=query_chunk_size,
                 f1_concat_max_set_size=f1_concat_max_set_size,
                 f1_concat_hidden=f1_concat_hidden,
@@ -256,6 +260,7 @@ class TinyViT(nn.Module):
         general_d_qk: Optional[int],
         f1_type: str,
         f2_type: str,
+        f1_query_mode: str,
         query_chunk_size: int,
         f1_concat_max_set_size: int,
         f1_concat_hidden: int,
@@ -289,6 +294,7 @@ class TinyViT(nn.Module):
                     general_d_qk=general_d_qk,
                     f1_type=f1_type,
                     f2_type=f2_type,
+                    f1_query_mode=f1_query_mode,
                     query_chunk_size=query_chunk_size,
                     f1_concat_max_set_size=f1_concat_max_set_size,
                     f1_concat_hidden=f1_concat_hidden,
@@ -659,6 +665,16 @@ def parse_args() -> argparse.Namespace:
         choices=["modular_dot", "logsumexp", "dot_repulsion", "neural_mlp"],
         default="modular_dot",
     )
+    parser.add_argument(
+        "--f1-query-mode",
+        choices=["none", "replace", "add"],
+        default="none",
+        help=(
+            "Optional query-conditioned pooling over selected members: "
+            "none (disabled), replace (use only query-conditioned pool), "
+            "or add (base F1 output + query-conditioned pool)."
+        ),
+    )
     parser.add_argument("--gibbs-beta", type=float, default=1.0)
     parser.add_argument("--gibbs-steps", type=int, default=100)
     parser.add_argument("--gibbs-runs", type=int, default=30)
@@ -776,6 +792,7 @@ def main() -> None:
         general_d_qk=args.general_d_qk,
         f1_type=args.f1_type,
         f2_type=args.f2_type,
+        f1_query_mode=args.f1_query_mode,
         query_chunk_size=args.query_chunk_size,
         f1_concat_max_set_size=args.f1_concat_max_set_size,
         f1_concat_hidden=args.f1_concat_hidden,
@@ -810,7 +827,7 @@ def main() -> None:
     if args.attention == "general":
         log(
             "general attention config:"
-            f" f1={args.f1_type}, f2={args.f2_type}, "
+            f" f1={args.f1_type}, f2={args.f2_type}, f1_query={args.f1_query_mode}, "
             f"steps={args.gibbs_steps}, runs={args.gibbs_runs}, beta={args.gibbs_beta}, "
             f"learned_tau={not args.disable_learned_tau}, tau_init={args.tau_init}"
         )
