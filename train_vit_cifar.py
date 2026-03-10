@@ -451,6 +451,17 @@ def accuracy(logits: torch.Tensor, targets: torch.Tensor) -> float:
     return (pred == targets).float().mean().item() * 100.0
 
 
+def count_trainable_params(model: nn.Module) -> int:
+    total = 0
+    for p in model.parameters():
+        if not p.requires_grad:
+            continue
+        if isinstance(p, torch.nn.parameter.UninitializedParameter):
+            continue
+        total += p.numel()
+    return int(total)
+
+
 def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -655,12 +666,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gibbs-init-p", type=float, default=0.5)
     parser.add_argument("--gibbs-logsumexp-eps", type=float, default=1e-6)
     parser.add_argument("--gibbs-repulsion-lambda", type=float, default=0.1)
+    parser.add_argument(
+        "--st-gradient-mode",
+        choices=["partial", "consistent"],
+        default="partial",
+        help=(
+            "Straight-through sampler-state gradient mode: "
+            "partial (default, hard side-state updates) or consistent (ST side-state updates)."
+        ),
+    )
     parser.add_argument("--query-chunk-size", type=int, default=128)
     parser.add_argument(
         "--f1-concat-max-set-size",
         type=int,
-        default=8,
-        help="Max selected subset tokens used by f1=mlp_concat or f1=transformer.",
+        default=16,
+        help=(
+            "Max selected subset tokens for explicit subset modules "
+            "(f1=mlp_concat/transformer and f2=neural_mlp key packing)."
+        ),
     )
     parser.add_argument(
         "--f1-concat-hidden",
@@ -730,10 +753,11 @@ def main() -> None:
         init_p=args.gibbs_init_p,
         logsumexp_eps=args.gibbs_logsumexp_eps,
         repulsion_lambda=args.gibbs_repulsion_lambda,
+        st_gradient_mode=args.st_gradient_mode,  # type: ignore[arg-type]
     )
     log(
         f"[setup] GibbsConfig: beta={cfg.beta}, steps={cfg.gibbs_steps}, runs={cfg.runs}, "
-        f"init={cfg.init}, init_p={cfg.init_p}"
+        f"init={cfg.init}, init_p={cfg.init_p}, st_gradient_mode={cfg.st_gradient_mode}"
     )
 
     log("[setup] building model")
@@ -781,7 +805,7 @@ def main() -> None:
         f"warmup_epochs={args.warmup_epochs}, amp={use_amp}"
     )
 
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    n_params = count_trainable_params(model)
     log(f"device={device}, attention={args.attention}, dataset={args.dataset}, params={n_params:,}")
     if args.attention == "general":
         log(

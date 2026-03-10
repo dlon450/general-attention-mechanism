@@ -32,6 +32,7 @@ import torch.nn as nn
 F2Type = Literal["modular_dot", "logsumexp", "dot_repulsion", "neural_mlp"]
 F1Type = Literal["mean", "mlp_mean", "mlp_concat", "transformer"]
 InitType = Literal["empty", "random"]
+STGradientMode = Literal["partial", "consistent"]
 
 class SetAggregator(nn.Module):
     """Base class for F1(S).
@@ -41,6 +42,49 @@ class SetAggregator(nn.Module):
     """
     def forward(self, sum_v: torch.Tensor, count: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
+
+
+def _pack_selected_members(
+    chain_x: torch.Tensor,       # (n_chains, L, d)
+    mask: torch.Tensor,          # (n_chains, L) bool
+    max_set_size: int,
+    rank_scores: Optional[torch.Tensor] = None,  # (n_chains, L)
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack up to max_set_size selected members, padded with zeros.
+
+    Members are chosen by top rank_scores among selected positions; if scores are
+    omitted, selected positions receive equal rank and truncation follows index
+    order after tie-breaking.
+    """
+
+    n_chains, L, d = chain_x.shape
+    keep = min(int(max_set_size), int(L))
+    if keep <= 0:
+        packed = chain_x.new_zeros((n_chains, 0, d))
+        picked = torch.zeros((n_chains, 0), device=mask.device, dtype=torch.bool)
+        return packed, picked
+
+    if rank_scores is None:
+        base_scores = mask.to(chain_x.dtype)
+    else:
+        base_scores = rank_scores.to(chain_x.dtype)
+    neg_inf = torch.finfo(base_scores.dtype).min
+    masked_scores = torch.where(mask, base_scores, torch.full_like(base_scores, neg_inf))
+    _, top_idx = torch.topk(masked_scores, k=keep, dim=1)
+    picked = torch.gather(mask, 1, top_idx)
+
+    # Keep canonical order of selected positions for downstream sequence models.
+    sentinel = torch.full_like(top_idx, L)
+    sortable = torch.where(picked, top_idx, sentinel)
+    sortable, order = torch.sort(sortable, dim=1)
+    picked = torch.gather(picked, 1, order)
+
+    safe_idx = torch.where(picked, sortable, torch.zeros_like(sortable))
+    gather_idx = safe_idx.unsqueeze(-1).expand(-1, -1, d)
+    packed = torch.gather(chain_x, 1, gather_idx)
+    packed = packed * picked.unsqueeze(-1).to(packed.dtype)
+    return packed, picked
+
 
 class MeanAggregator(SetAggregator):
     def __init__(self, eps: float = 1e-8, empty_value: float = 0.0):
@@ -83,10 +127,10 @@ class MLPMeanAggregator(SetAggregator):
 class ConcatMLPAggregator(SetAggregator):
     """Learnable F1 over explicit subset members.
 
-    Selects up to `max_set_size` members from S in index order, zero-pads if needed,
+    Selects up to `max_set_size` members from S by relevance, zero-pads if needed,
     concatenates them, appends log(1+|S|), and applies an MLP.
     """
-    def __init__(self, d_v: int, max_set_size: int = 8, hidden: int = 128):
+    def __init__(self, d_v: int, max_set_size: int = 16, hidden: int = 128):
         super().__init__()
         self.d_v = int(d_v)
         self.max_set_size = int(max_set_size)
@@ -107,31 +151,18 @@ class ConcatMLPAggregator(SetAggregator):
         batch_idx: torch.Tensor,  # (n_chains,)
         mask: torch.Tensor,       # (n_chains, L) bool
         count: torch.Tensor,      # (n_chains,)
+        rank_scores: Optional[torch.Tensor] = None,  # (n_chains, L)
     ) -> torch.Tensor:
-        n_chains, L = mask.shape
         chain_v = v[batch_idx]  # (n_chains, L, d_v)
         d_v = chain_v.shape[-1]
-        k_keep = min(self.max_set_size, L)
-
-        if k_keep > 0:
-            pos = torch.arange(L, device=mask.device, dtype=torch.float32)
-            # Selected positions get positive scores; top-k prefers lower indices.
-            scores = mask.to(torch.float32) * (float(L) - pos).unsqueeze(0)
-            top_scores, top_idx = torch.topk(scores, k=k_keep, dim=1)
-            picked = top_scores > 0
-
-            sentinel = torch.full_like(top_idx, L)
-            sortable = torch.where(picked, top_idx, sentinel)
-            sortable, order = torch.sort(sortable, dim=1)
-            picked = torch.gather(picked, 1, order)
-
-            safe_idx = torch.where(picked, sortable, torch.zeros_like(sortable))
-            gather_idx = safe_idx.unsqueeze(-1).expand(-1, -1, d_v)
-            packed = torch.gather(chain_v, 1, gather_idx)
-            packed = packed * picked.unsqueeze(-1).to(packed.dtype)
-        else:
-            packed = chain_v.new_zeros((n_chains, 0, d_v))
-
+        packed, _ = _pack_selected_members(
+            chain_x=chain_v,
+            mask=mask,
+            max_set_size=self.max_set_size,
+            rank_scores=rank_scores,
+        )
+        n_chains = packed.shape[0]
+        k_keep = packed.shape[1]
         if k_keep < self.max_set_size:
             pad = chain_v.new_zeros((n_chains, self.max_set_size - k_keep, d_v))
             packed = torch.cat([packed, pad], dim=1)
@@ -145,7 +176,7 @@ class ConcatMLPAggregator(SetAggregator):
 class TransformerSubsetAggregator(SetAggregator):
     """Lightweight Transformer F1 over explicit subset members.
 
-    Selects up to `max_set_size` members from S in index order, runs a tiny
+    Selects up to `max_set_size` members from S by relevance, runs a tiny
     Transformer encoder over the packed sequence, masked-mean pools valid
     positions, appends log(1+|S|), and projects back to d_v.
     """
@@ -153,7 +184,7 @@ class TransformerSubsetAggregator(SetAggregator):
     def __init__(
         self,
         d_v: int,
-        max_set_size: int = 8,
+        max_set_size: int = 16,
         hidden: int = 128,
         num_layers: int = 1,
         num_heads: int = 4,
@@ -201,33 +232,20 @@ class TransformerSubsetAggregator(SetAggregator):
         batch_idx: torch.Tensor,  # (n_chains,)
         mask: torch.Tensor,       # (n_chains, L) bool
         count: torch.Tensor,      # (n_chains,)
+        rank_scores: Optional[torch.Tensor] = None,  # (n_chains, L)
     ) -> torch.Tensor:
-        n_chains, L = mask.shape
         chain_v = v[batch_idx]  # (n_chains, L, d_v)
         d_v = chain_v.shape[-1]
         if d_v != self.d_v:
             raise ValueError("TransformerSubsetAggregator d_v mismatch")
 
-        k_keep = min(self.max_set_size, L)
-        if k_keep > 0:
-            pos = torch.arange(L, device=mask.device, dtype=torch.float32)
-            scores = mask.to(torch.float32) * (float(L) - pos).unsqueeze(0)
-            top_scores, top_idx = torch.topk(scores, k=k_keep, dim=1)
-            picked = top_scores > 0
-
-            sentinel = torch.full_like(top_idx, L)
-            sortable = torch.where(picked, top_idx, sentinel)
-            sortable, order = torch.sort(sortable, dim=1)
-            picked = torch.gather(picked, 1, order)
-
-            safe_idx = torch.where(picked, sortable, torch.zeros_like(sortable))
-            gather_idx = safe_idx.unsqueeze(-1).expand(-1, -1, d_v)
-            packed = torch.gather(chain_v, 1, gather_idx)
-            packed = packed * picked.unsqueeze(-1).to(packed.dtype)
-        else:
-            packed = chain_v.new_zeros((n_chains, 0, d_v))
-            picked = torch.zeros((n_chains, 0), device=mask.device, dtype=torch.bool)
-
+        packed, picked = _pack_selected_members(
+            chain_x=chain_v,
+            mask=mask,
+            max_set_size=self.max_set_size,
+            rank_scores=rank_scores,
+        )
+        n_chains, k_keep, _ = packed.shape
         if k_keep < self.max_set_size:
             pad = chain_v.new_zeros((n_chains, self.max_set_size - k_keep, d_v))
             packed = torch.cat([packed, pad], dim=1)
@@ -263,7 +281,7 @@ def build_f1(
     f1_type: F1Type,
     d_v: int,
     *,
-    concat_max_set_size: int = 8,
+    concat_max_set_size: int = 16,
     concat_hidden: int = 128,
 ) -> SetAggregator:
     if f1_type == "mean":
@@ -292,16 +310,17 @@ class NeuralMLPF2(nn.Module):
         d_qk: int,
         hidden: int = 128,
         eps: float = 1e-8,
-        max_set_size: Optional[int] = None,
+        max_set_size: int = 16,
     ):
         super().__init__()
         self.d_qk = int(d_qk)
         self.eps = float(eps)
-        self.max_set_size = int(max_set_size) if max_set_size is not None else None
-        if self.max_set_size is not None and self.max_set_size <= 0:
+        self.max_set_size = int(max_set_size)
+        if self.max_set_size <= 0:
             raise ValueError("f2 neural max_set_size must be > 0")
+        in_dim = self.d_qk + self.max_set_size * self.d_qk + 1
         self.mlp = nn.Sequential(
-            nn.LazyLinear(hidden),
+            nn.Linear(in_dim, hidden),
             nn.GELU(),
             nn.Linear(hidden, 1),
         )
@@ -309,35 +328,25 @@ class NeuralMLPF2(nn.Module):
     def _pack_subset_keys(
         self,
         k: torch.Tensor,          # (B, L, d_qk)
+        q: torch.Tensor,          # (n_chains, d_qk)
         batch_idx: torch.Tensor,  # (n_chains,)
         mask: torch.Tensor,       # (n_chains, L) bool
     ) -> torch.Tensor:
-        n_chains, L = mask.shape
         chain_k = k[batch_idx]  # (n_chains, L, d_qk)
         d_qk = chain_k.shape[-1]
         if d_qk != self.d_qk:
             raise ValueError("NeuralMLPF2 d_qk mismatch")
 
-        keep = L if self.max_set_size is None else min(self.max_set_size, L)
-        if keep > 0:
-            pos = torch.arange(L, device=mask.device, dtype=torch.float32)
-            scores = mask.to(torch.float32) * (float(L) - pos).unsqueeze(0)
-            top_scores, top_idx = torch.topk(scores, k=keep, dim=1)
-            picked = top_scores > 0
-
-            sentinel = torch.full_like(top_idx, L)
-            sortable = torch.where(picked, top_idx, sentinel)
-            sortable, order = torch.sort(sortable, dim=1)
-            picked = torch.gather(picked, 1, order)
-
-            safe_idx = torch.where(picked, sortable, torch.zeros_like(sortable))
-            gather_idx = safe_idx.unsqueeze(-1).expand(-1, -1, d_qk)
-            packed = torch.gather(chain_k, 1, gather_idx)
-            packed = packed * picked.unsqueeze(-1).to(packed.dtype)
-        else:
-            packed = chain_k.new_zeros((n_chains, 0, d_qk))
-
-        if self.max_set_size is not None and keep < self.max_set_size:
+        score_scale = 1.0 / math.sqrt(d_qk)
+        rank_scores = (chain_k * q.unsqueeze(1)).sum(dim=-1) * score_scale
+        packed, _ = _pack_selected_members(
+            chain_x=chain_k,
+            mask=mask,
+            max_set_size=self.max_set_size,
+            rank_scores=rank_scores,
+        )
+        n_chains, keep, _ = packed.shape
+        if keep < self.max_set_size:
             pad = chain_k.new_zeros((n_chains, self.max_set_size - keep, d_qk))
             packed = torch.cat([packed, pad], dim=1)
 
@@ -351,7 +360,7 @@ class NeuralMLPF2(nn.Module):
         mask: torch.Tensor,       # (n_chains, L) bool
         count: torch.Tensor,      # (n_chains,)
     ) -> torch.Tensor:
-        packed = self._pack_subset_keys(k=k, batch_idx=batch_idx, mask=mask)
+        packed = self._pack_subset_keys(k=k, q=q, batch_idx=batch_idx, mask=mask)
         log_count = torch.log1p(count.to(q.dtype)).unsqueeze(-1)
         feat = torch.cat([q, packed.to(q.dtype), log_count], dim=-1)
         return self.mlp(feat).squeeze(-1)
@@ -378,6 +387,8 @@ class GibbsConfig:
     repulsion_lambda: float = 0.1
     # Use straight-through gradients through Bernoulli decisions so Q/K can train.
     straight_through: bool = True
+    # partial: update sampler side-state with hard sign; consistent: use ST sign.
+    st_gradient_mode: STGradientMode = "partial"
 
 def _gibbs_sample_subsets(
     q: torch.Tensor,     # (B, Lq, d_qk)
@@ -515,13 +526,25 @@ def _gibbs_sample_subsets(
         count = count + sign_hard.to(torch.int32)
         count_f = count_f + sign
         sum_v = sum_v + sign.unsqueeze(-1) * vv
+        if cfg.st_gradient_mode not in ("partial", "consistent"):
+            raise ValueError("st_gradient_mode must be one of: partial, consistent")
+        state_sign = sign_hard
+        if cfg.straight_through and cfg.st_gradient_mode == "consistent":
+            state_sign = sign
         if f2_type == "dot_repulsion":
-            sum_k = sum_k + sign_hard.unsqueeze(-1) * kv
+            sum_k = sum_k + state_sign.unsqueeze(-1) * kv
         elif f2_type == "logsumexp":
-            sum_w = sum_w + sign_hard * torch.exp(a_v)
+            sum_w = sum_w + state_sign * torch.exp(a_v)
 
     if isinstance(f1, (ConcatMLPAggregator, TransformerSubsetAggregator)):
-        out_chain = f1.forward_subset(v=v_f, batch_idx=batch_idx, mask=mask, count=count_f)  # (n_chains, d_v)
+        rank_scores = (k_f[batch_idx] * q_rep.unsqueeze(1)).sum(dim=-1) * scale
+        out_chain = f1.forward_subset(
+            v=v_f,
+            batch_idx=batch_idx,
+            mask=mask,
+            count=count_f,
+            rank_scores=rank_scores,
+        )  # (n_chains, d_v)
     else:
         out_chain = f1(sum_v, count_f)  # (n_chains, d_v)
     out = out_chain.view(B, Lq, cfg.runs, d_v).mean(dim=2)
@@ -545,7 +568,7 @@ class GeneralAttention(nn.Module):
         bias: bool = False,
         use_learned_tau: bool = True,
         tau_init: float = 0.0,
-        f1_concat_max_set_size: int = 8,
+        f1_concat_max_set_size: int = 16,
         f1_concat_hidden: int = 128,
         f2_neural_hidden: int = 128,
     ):
@@ -565,7 +588,15 @@ class GeneralAttention(nn.Module):
             concat_max_set_size=f1_concat_max_set_size,
             concat_hidden=f1_concat_hidden,
         )
-        self.f2_neural = NeuralMLPF2(self.d_qk, hidden=f2_neural_hidden) if self.f2_type == "neural_mlp" else None
+        self.f2_neural = (
+            NeuralMLPF2(
+                self.d_qk,
+                hidden=f2_neural_hidden,
+                max_set_size=f1_concat_max_set_size,
+            )
+            if self.f2_type == "neural_mlp"
+            else None
+        )
         self.tau_fn = QueryTau(self.d_qk, init_value=tau_init) if use_learned_tau else None
         self.cfg = cfg if cfg is not None else GibbsConfig()
 
