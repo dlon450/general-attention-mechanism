@@ -8,22 +8,25 @@ Implements:
   - Output x' = E_p[F1(S)]
   - Approximate E using m independent runs of Algorithm 1 (random-scan Gibbs sampler)
     from Gotovos et al., "Sampling from Probabilistic Submodular Models" (NeurIPS 2015).
+  - restricted_softmax + full_set recovers ordinary scaled dot-product attention exactly.
 
 We provide F2 instantiations:
-  1) modular_dot:   F(S) = Σ_{i∈S} a_i, a_i = <q,k_i>/√d
-  2) modular_dot_hard_singleton:
+  1) full_set:      S = {1, ..., L} deterministically
+  2) modular_dot:   F(S) = Σ_{i∈S} a_i, a_i = <q,k_i>/√d
+  3) modular_dot_hard_singleton:
                      F(S) = Σ_{i∈S} a_i - τ(q) 1[|S| > 1]
-  3) modular_dot_first_free:
+  4) modular_dot_first_free:
                      F(S) = Σ_{i∈S} a_i - τ(q) (|S|-1)_+
-  4) logsumexp:     F(S) = log(ε + Σ_{i∈S} exp(a_i))
-  5) dot_repulsion: F(S) = Σ_{i∈S} a_i - λ Σ_{i<j∈S} <k_i,k_j>/√d
-  6) neural_mlp:    F(S) = MLP([q, k_{i1}, ..., k_{ir} (padded), log(1+|S|)])
+  5) logsumexp:     F(S) = log(ε + Σ_{i∈S} exp(a_i))
+  6) dot_repulsion: F(S) = Σ_{i∈S} a_i - λ Σ_{i<j∈S} <k_i,k_j>/√d
+  7) neural_mlp:    F(S) = MLP([q, k_{i1}, ..., k_{ir} (padded), log(1+|S|)])
 
 and F1 instantiations:
   - mean
   - mlp_mean
   - mlp_concat (explicit subset members, padded/truncated)
   - transformer (tiny Transformer over explicit subset members)
+  - restricted_softmax (ordinary attention weights over the selected support)
 """
 from __future__ import annotations
 
@@ -34,6 +37,7 @@ import torch
 import torch.nn as nn
 
 F2Type = Literal[
+    "full_set",
     "modular_dot",
     "modular_dot_hard_singleton",
     "modular_dot_first_free",
@@ -41,7 +45,7 @@ F2Type = Literal[
     "dot_repulsion",
     "neural_mlp",
 ]
-F1Type = Literal["mean", "mlp_mean", "mlp_concat", "transformer"]
+F1Type = Literal["mean", "mlp_mean", "mlp_concat", "transformer", "restricted_softmax"]
 InitType = Literal["empty", "random"]
 STGradientMode = Literal["partial", "consistent"]
 F1QueryMode = Literal["none", "replace", "add"]
@@ -146,6 +150,32 @@ def _query_conditioned_subset_pool(
     return pooled
 
 
+def _restricted_softmax_subset_pool(
+    rank_scores: torch.Tensor,   # (n_chains, L)
+    v: torch.Tensor,             # (B, L, d_v)
+    batch_idx: torch.Tensor,     # (n_chains,)
+    mask: torch.Tensor,          # (n_chains, L)
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Softmax attention restricted to mask=True positions.
+
+    When the support is empty, this returns a zero vector for that chain.
+    """
+
+    chain_v = v[batch_idx]  # (n_chains, L, d_v)
+    mask_f = mask.to(rank_scores.dtype)
+    non_empty = mask.any(dim=1, keepdim=True)
+    neg_inf = torch.finfo(rank_scores.dtype).min
+    masked_scores = torch.where(mask, rank_scores, torch.full_like(rank_scores, neg_inf))
+    row_max = masked_scores.max(dim=1, keepdim=True).values
+    row_max = torch.where(non_empty, row_max, torch.zeros_like(row_max))
+    exp_scores = torch.exp(rank_scores - row_max) * mask_f
+    denom = exp_scores.sum(dim=1, keepdim=True).clamp_min(float(eps))
+    weights = exp_scores / denom
+    weights = torch.where(non_empty, weights, torch.zeros_like(weights))
+    return (weights.unsqueeze(-1).to(chain_v.dtype) * chain_v).sum(dim=1)
+
+
 class MeanAggregator(SetAggregator):
     def __init__(self, eps: float = 1e-8, empty_value: float = 0.0):
         super().__init__()
@@ -163,6 +193,7 @@ class MeanAggregator(SetAggregator):
         else:
             out = torch.where(count.unsqueeze(-1) > 0, out, torch.zeros_like(out))
         return out
+
 
 class MLPMeanAggregator(SetAggregator):
     """Learnable F1 that still only needs (sum_v, count):
@@ -183,6 +214,7 @@ class MLPMeanAggregator(SetAggregator):
         log_count = torch.log1p(count.to(sum_v.dtype)).unsqueeze(-1)
         x = torch.cat([mean_v, log_count], dim=-1)
         return self.mlp(x)
+
 
 class ConcatMLPAggregator(SetAggregator):
     """Learnable F1 over explicit subset members.
@@ -231,6 +263,38 @@ class ConcatMLPAggregator(SetAggregator):
         log_count = torch.log1p(count.to(chain_v.dtype)).unsqueeze(-1)
         x = torch.cat([flat, log_count], dim=-1)
         return self.mlp(x)
+
+
+class RestrictedSoftmaxAggregator(SetAggregator):
+    """Exact softmax attention weights over the selected support."""
+
+    def __init__(self, eps: float = 1e-8):
+        super().__init__()
+        self.eps = float(eps)
+
+    def forward(self, sum_v: torch.Tensor, count: torch.Tensor) -> torch.Tensor:
+        raise RuntimeError(
+            "RestrictedSoftmaxAggregator requires q/k-aware subset masks; call forward_subset"
+        )
+
+    def forward_subset(
+        self,
+        v: torch.Tensor,          # (B, L, d_v)
+        batch_idx: torch.Tensor,  # (n_chains,)
+        mask: torch.Tensor,       # (n_chains, L) bool
+        count: torch.Tensor,      # (n_chains,)
+        rank_scores: Optional[torch.Tensor] = None,  # (n_chains, L)
+    ) -> torch.Tensor:
+        del count
+        if rank_scores is None:
+            raise ValueError("f1_type='restricted_softmax' requires rank_scores")
+        return _restricted_softmax_subset_pool(
+            rank_scores=rank_scores,
+            v=v,
+            batch_idx=batch_idx,
+            mask=mask,
+            eps=self.eps,
+        )
 
 
 class TransformerSubsetAggregator(SetAggregator):
@@ -360,6 +424,8 @@ def build_f1(
             max_set_size=concat_max_set_size,
             hidden=concat_hidden,
         )
+    if f1_type == "restricted_softmax":
+        return RestrictedSoftmaxAggregator()
     raise ValueError(f"Unknown f1_type: {f1_type}")
 
 class NeuralMLPF2(nn.Module):
@@ -474,6 +540,8 @@ def _gibbs_sample_subsets(
     if cfg.beta <= 0: raise ValueError("beta must be > 0")
     if cfg.gibbs_steps <= 0: raise ValueError("gibbs_steps must be > 0")
     if cfg.runs <= 0: raise ValueError("runs must be > 0")
+    if f2_type == "full_set":
+        raise ValueError("f2_type='full_set' must use the deterministic support path")
 
     B, Lq, d_qk = q.shape
     _, L, d_qk2 = k.shape
@@ -645,24 +713,67 @@ def _gibbs_sample_subsets(
         elif f2_type == "logsumexp":
             sum_w = sum_w + state_sign * torch.exp(a_v)
 
+    out_chain = _apply_f1_to_support(
+        f1=f1,
+        v=v_f,
+        batch_idx=batch_idx,
+        mask=mask,
+        count=count_f,
+        rank_scores=rank_scores_rep,
+        sum_v=sum_v,
+        f1_query_mode=f1_query_mode,
+        f1_query_max_set_size=f1_query_max_set_size,
+    )
+    out = out_chain.view(B, Lq, cfg.runs, d_v).mean(dim=2)
+    return out
+
+
+def _apply_f1_to_support(
+    *,
+    f1: SetAggregator,
+    v: torch.Tensor,             # (B, L, d_v)
+    batch_idx: torch.Tensor,     # (n_supports,)
+    mask: torch.Tensor,          # (n_supports, L)
+    count: torch.Tensor,         # (n_supports,)
+    rank_scores: torch.Tensor,   # (n_supports, L)
+    sum_v: Optional[torch.Tensor],
+    f1_query_mode: F1QueryMode,
+    f1_query_max_set_size: int,
+) -> torch.Tensor:
+    if isinstance(f1, RestrictedSoftmaxAggregator):
+        if f1_query_mode != "none":
+            raise ValueError(
+                "f1_type='restricted_softmax' is already query-conditioned; "
+                "use f1_query_mode='none'"
+            )
+        return f1.forward_subset(
+            v=v,
+            batch_idx=batch_idx,
+            mask=mask,
+            count=count,
+            rank_scores=rank_scores,
+        )
+
     out_chain: Optional[torch.Tensor]
     if f1_query_mode == "replace":
         out_chain = None
     elif isinstance(f1, (ConcatMLPAggregator, TransformerSubsetAggregator)):
         out_chain = f1.forward_subset(
-            v=v_f,
+            v=v,
             batch_idx=batch_idx,
             mask=mask,
-            count=count_f,
-            rank_scores=rank_scores_rep,
-        )  # (n_chains, d_v)
+            count=count,
+            rank_scores=rank_scores,
+        )
     else:
-        out_chain = f1(sum_v, count_f)  # (n_chains, d_v)
+        if sum_v is None:
+            raise ValueError("sum_v is required for summary-stat F1 aggregators")
+        out_chain = f1(sum_v, count)
 
     if f1_query_mode != "none":
         q_ctx = _query_conditioned_subset_pool(
-            rank_scores=rank_scores_rep,
-            v=v_f,
+            rank_scores=rank_scores,
+            v=v,
             batch_idx=batch_idx,
             mask=mask,
             max_set_size=f1_query_max_set_size,
@@ -672,10 +783,59 @@ def _gibbs_sample_subsets(
         else:
             assert out_chain is not None
             out_chain = out_chain + q_ctx
-    else:
-        assert out_chain is not None
-    out = out_chain.view(B, Lq, cfg.runs, d_v).mean(dim=2)
-    return out
+
+    assert out_chain is not None
+    return out_chain
+
+
+def _deterministic_full_set_output(
+    q: torch.Tensor,     # (B, Lq, d_qk)
+    k: torch.Tensor,     # (B, L,  d_qk)
+    v: torch.Tensor,     # (B, L,  d_v)
+    f1: SetAggregator,
+    *,
+    f1_query_mode: F1QueryMode,
+    f1_query_max_set_size: int,
+) -> torch.Tensor:
+    """Deterministic support path for full_set; skips Gibbs and MC entirely."""
+
+    B, Lq, d_qk = q.shape
+    _, L, _ = k.shape
+    _, Lv, d_v = v.shape
+    if L != Lv:
+        raise ValueError("k/v length mismatch")
+    scale = 1.0 / math.sqrt(d_qk)
+    rank_scores = torch.matmul(q, k.transpose(1, 2)) * scale  # (B, Lq, L)
+
+    if isinstance(f1, RestrictedSoftmaxAggregator):
+        if f1_query_mode != "none":
+            raise ValueError(
+                "f1_type='restricted_softmax' is already query-conditioned; "
+                "use f1_query_mode='none'"
+            )
+        # Exact-special-case path: ordinary scaled dot-product attention.
+        weights = torch.softmax(rank_scores, dim=-1)
+        return weights @ v
+
+    n_supports = B * Lq
+    batch_idx = torch.arange(B, device=q.device).repeat_interleave(Lq)
+    mask = torch.ones((n_supports, L), device=q.device, dtype=torch.bool)
+    count = torch.full((n_supports,), L, device=q.device, dtype=q.dtype)
+    rank_scores_flat = rank_scores.reshape(n_supports, L)
+    sum_v = v[batch_idx].sum(dim=1)
+
+    out = _apply_f1_to_support(
+        f1=f1,
+        v=v,
+        batch_idx=batch_idx,
+        mask=mask,
+        count=count,
+        rank_scores=rank_scores_flat,
+        sum_v=sum_v,
+        f1_query_mode=f1_query_mode,
+        f1_query_max_set_size=f1_query_max_set_size,
+    )
+    return out.view(B, Lq, d_v)
 
 class GeneralAttention(nn.Module):
     """General subset attention.
@@ -710,6 +870,7 @@ class GeneralAttention(nn.Module):
         self.W_V = nn.Linear(self.d_model, self.d_v, bias=bias)
 
         self.f2_type = f2_type
+        self.f1_type = f1_type
         self.f1 = build_f1(
             f1_type,
             d_v=self.d_v,
@@ -732,6 +893,11 @@ class GeneralAttention(nn.Module):
             raise ValueError("f1_concat_max_set_size must be > 0")
         if f1_query_mode not in ("none", "replace", "add"):
             raise ValueError("f1_query_mode must be one of: none, replace, add")
+        if f1_type == "restricted_softmax" and f1_query_mode != "none":
+            raise ValueError(
+                "f1_type='restricted_softmax' is already query-conditioned; "
+                "use f1_query_mode='none'"
+            )
         self.f1_query_mode = f1_query_mode
 
         self.query_chunk_size = int(query_chunk_size)
@@ -758,16 +924,26 @@ class GeneralAttention(nn.Module):
         for start in range(0, L, self.query_chunk_size):
             end = min(L, start + self.query_chunk_size)
             q_chunk = q[:, start:end, :]
-            out_chunk = _gibbs_sample_subsets(
-                q=q_chunk, k=k, v=v,
-                cfg=self.cfg,
-                f2_type=self.f2_type,
-                f1=self.f1,
-                f2_neural=self.f2_neural,
-                tau_fn=self.tau_fn,
-                f1_query_mode=self.f1_query_mode,
-                f1_query_max_set_size=self.f1_concat_max_set_size,
-            )
+            if self.f2_type == "full_set":
+                out_chunk = _deterministic_full_set_output(
+                    q=q_chunk,
+                    k=k,
+                    v=v,
+                    f1=self.f1,
+                    f1_query_mode=self.f1_query_mode,
+                    f1_query_max_set_size=self.f1_concat_max_set_size,
+                )
+            else:
+                out_chunk = _gibbs_sample_subsets(
+                    q=q_chunk, k=k, v=v,
+                    cfg=self.cfg,
+                    f2_type=self.f2_type,
+                    f1=self.f1,
+                    f2_neural=self.f2_neural,
+                    tau_fn=self.tau_fn,
+                    f1_query_mode=self.f1_query_mode,
+                    f1_query_max_set_size=self.f1_concat_max_set_size,
+                )
             outs.append(out_chunk)
         y = torch.cat(outs, dim=1)
         return y.squeeze(0) if squeeze_batch else y

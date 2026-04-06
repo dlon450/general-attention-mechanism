@@ -624,7 +624,13 @@ def build_scheduler(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Tiny ViT CIFAR baseline vs general attention")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Tiny ViT CIFAR baseline vs general attention. "
+            "Exact ordinary attention is recovered with "
+            "--f1-type restricted_softmax --f2-type full_set --f1-query-mode none."
+        )
+    )
     parser.add_argument("--dataset", choices=["cifar10", "cifar100"], default="cifar10")
     parser.add_argument("--data-dir", type=Path, default=Path("./data"))
     parser.add_argument("--download", action="store_true")
@@ -657,12 +663,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--general-d-qk", type=int, default=None)
     parser.add_argument(
         "--f1-type",
-        choices=["mean", "mlp_mean", "mlp_concat", "transformer"],
+        choices=["mean", "mlp_mean", "mlp_concat", "transformer", "restricted_softmax"],
         default="mean",
+        help=(
+            "General-attention F1. "
+            "Use restricted_softmax with f2=full_set and f1_query_mode=none "
+            "to recover ordinary scaled dot-product attention exactly."
+        ),
     )
     parser.add_argument(
         "--f2-type",
         choices=[
+            "full_set",
             "modular_dot",
             "modular_dot_hard_singleton",
             "modular_dot_first_free",
@@ -671,6 +683,11 @@ def parse_args() -> argparse.Namespace:
             "neural_mlp",
         ],
         default="modular_dot",
+        help=(
+            "General-attention F2. "
+            "full_set deterministically selects all tokens and, together with "
+            "f1=restricted_softmax and f1_query_mode=none, recovers ordinary attention exactly."
+        ),
     )
     parser.add_argument(
         "--f1-query-mode",
@@ -679,7 +696,8 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Optional query-conditioned pooling over selected members: "
             "none (disabled), replace (use only query-conditioned pool), "
-            "or add (base F1 output + query-conditioned pool)."
+            "or add (base F1 output + query-conditioned pool). "
+            "restricted_softmax is already query-conditioned and requires none."
         ),
     )
     parser.add_argument("--gibbs-beta", type=float, default=1.0)
@@ -838,6 +856,12 @@ def main() -> None:
             f"steps={args.gibbs_steps}, runs={args.gibbs_runs}, beta={args.gibbs_beta}, "
             f"learned_tau={not args.disable_learned_tau}, tau_init={args.tau_init}"
         )
+        if (
+            args.f1_type == "restricted_softmax"
+            and args.f2_type == "full_set"
+            and args.f1_query_mode == "none"
+        ):
+            log("[setup] exact_attention_special_case=True")
 
     metrics: list[EpochMetrics] = []
     best_val = -1.0
