@@ -11,9 +11,13 @@ Implements:
 
 We provide F2 instantiations:
   1) modular_dot:   F(S) = Σ_{i∈S} a_i, a_i = <q,k_i>/√d
-  2) logsumexp:     F(S) = log(ε + Σ_{i∈S} exp(a_i))
-  3) dot_repulsion: F(S) = Σ_{i∈S} a_i - λ Σ_{i<j∈S} <k_i,k_j>/√d
-  4) neural_mlp:    F(S) = MLP([q, k_{i1}, ..., k_{ir} (padded), log(1+|S|)])
+  2) modular_dot_hard_singleton:
+                     F(S) = Σ_{i∈S} a_i - τ(q) 1[|S| > 1]
+  3) modular_dot_first_free:
+                     F(S) = Σ_{i∈S} a_i - τ(q) (|S|-1)_+
+  4) logsumexp:     F(S) = log(ε + Σ_{i∈S} exp(a_i))
+  5) dot_repulsion: F(S) = Σ_{i∈S} a_i - λ Σ_{i<j∈S} <k_i,k_j>/√d
+  6) neural_mlp:    F(S) = MLP([q, k_{i1}, ..., k_{ir} (padded), log(1+|S|)])
 
 and F1 instantiations:
   - mean
@@ -29,7 +33,14 @@ import math
 import torch
 import torch.nn as nn
 
-F2Type = Literal["modular_dot", "logsumexp", "dot_repulsion", "neural_mlp"]
+F2Type = Literal[
+    "modular_dot",
+    "modular_dot_hard_singleton",
+    "modular_dot_first_free",
+    "logsumexp",
+    "dot_repulsion",
+    "neural_mlp",
+]
 F1Type = Literal["mean", "mlp_mean", "mlp_concat", "transformer"]
 InitType = Literal["empty", "random"]
 STGradientMode = Literal["partial", "consistent"]
@@ -536,8 +547,28 @@ def _gibbs_sample_subsets(
 
         a_v = (q_rep * kv).sum(dim=-1) * scale
 
+        tau_logits = tau_q
+
         if f2_type == "modular_dot":
             delta = a_v
+        elif f2_type == "modular_dot_hard_singleton":
+            count_excl = count - old_in.to(count.dtype)
+            if tau_q is not None:
+                second_token_penalty = tau_q * (count_excl == 1).to(tau_q.dtype)
+                delta = a_v - second_token_penalty
+                tau_logits = None
+            else:
+                delta = a_v
+                tau_logits = None
+        elif f2_type == "modular_dot_first_free":
+            count_excl = count - old_in.to(count.dtype)
+            if tau_q is not None:
+                extra_token_penalty = tau_q * (count_excl > 0).to(tau_q.dtype)
+                delta = a_v - extra_token_penalty
+                tau_logits = None
+            else:
+                delta = a_v
+                tau_logits = None
         elif f2_type == "logsumexp":
             assert sum_w is not None
             wv = torch.exp(a_v)
@@ -581,8 +612,8 @@ def _gibbs_sample_subsets(
         else:
             raise ValueError(f"Unknown f2_type: {f2_type}")
 
-        if tau_q is not None:
-            logits = beta * (delta - tau_q)
+        if tau_logits is not None:
+            logits = beta * (delta - tau_logits)
         else:
             logits = beta * delta
         p_add = torch.sigmoid(logits)

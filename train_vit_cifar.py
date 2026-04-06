@@ -662,7 +662,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--f2-type",
-        choices=["modular_dot", "logsumexp", "dot_repulsion", "neural_mlp"],
+        choices=[
+            "modular_dot",
+            "modular_dot_hard_singleton",
+            "modular_dot_first_free",
+            "logsumexp",
+            "dot_repulsion",
+            "neural_mlp",
+        ],
         default="modular_dot",
     )
     parser.add_argument(
