@@ -321,57 +321,98 @@ def save_results(all_results: dict, cfg: dict, results_dir: Path):
 
 # ── Data download ─────────────────────────────────────────────────────────────
 
-LRA_RELEASE_URL = "https://storage.googleapis.com/long-range-arena/lra_release.gz"
+def _load_hf_dataset(hf_path: str, config: str, **kwargs):
+    """Load a HuggingFace dataset, returning None if unavailable."""
+    try:
+        from datasets import load_dataset
+        return load_dataset(hf_path, config, trust_remote_code=True, **kwargs)
+    except Exception as e:
+        print(f"  HuggingFace load failed ({e})")
+        return None
 
 
-def _stream_extract(url: str, prefix: str, dest_root: Path, stop_count=None) -> int:
-    """Stream a .tar.gz from url, save members matching prefix into dest_root."""
-    print(f"  Streaming {url} ...")
-    resp  = requests.get(url, stream=True)
-    resp.raise_for_status()
-    count = 0
-    with tarfile.open(fileobj=resp.raw, mode="r|gz") as tar:
-        for member in tar:
-            if not member.name.startswith(prefix) or member.isdir():
-                continue
-            rel  = member.name[len(prefix):]
-            dest = dest_root / rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            f = tar.extractfile(member)
-            if f:
-                dest.write_bytes(f.read())
-                count += 1
-                if count % 500 == 0:
-                    print(f"    ... {count} files extracted")
-            if stop_count and count >= stop_count:
-                break
-    return count
-
-
-def download_listops(root: Path) -> Path:
+def download_listops(root: Path):
+    """Download ListOps via HuggingFace datasets and save as TSV files."""
     dest   = root / "listops-1000"
     needed = ["basic_train.tsv", "basic_val.tsv", "basic_test.tsv"]
     if all((dest / f).exists() for f in needed):
         print(f"ListOps already present at {dest}")
         return dest
+
+    print("  Downloading ListOps via HuggingFace datasets ...")
+    ds = _load_hf_dataset("conceptofmind/listops-1000", None)
+    if ds is None:
+        # try alternative name
+        ds = _load_hf_dataset("long_range_arena", "listops")
+    if ds is None:
+        print("  Could not download ListOps — will use synthetic data.")
+        return None
+
     dest.mkdir(parents=True, exist_ok=True)
-    n = _stream_extract(LRA_RELEASE_URL,
-                        "lra_release/lra_data/listops-1000/",
-                        dest, stop_count=len(needed))
-    print(f"  ListOps: {n} files -> {dest}")
-    return dest
+    split_map = {"train": "basic_train.tsv", "validation": "basic_val.tsv",
+                 "test": "basic_test.tsv"}
+    tok2id = LISTOPS_TOKENS
+    id2tok = {v: k for k, v in tok2id.items()}
+
+    for hf_split, fname in split_map.items():
+        if hf_split not in ds:
+            continue
+        with open(dest / fname, "w") as f:
+            f.write("label\tsequence\n")
+            for row in ds[hf_split]:
+                label = row.get("label", row.get("labels", 0))
+                # input may be token ids or raw text
+                inp = row.get("input_ids", row.get("input", row.get("Source", "")))
+                if isinstance(inp, list):
+                    seq = " ".join(id2tok.get(t, "PAD") for t in inp)
+                else:
+                    seq = str(inp)
+                f.write(f"{label}\t{seq}\n")
+        print(f"  Saved {fname}")
+
+    if all((dest / f).exists() for f in needed):
+        return dest
+
+    print("  ListOps download incomplete — will use synthetic data.")
+    return None
 
 
-def download_pathfinder(root: Path, img_size: int = 32) -> Path:
-    dest = root / f"pathfinder{img_size}" / "curv_contour_length_14"
-    if dest.exists() and any(dest.rglob("*.png")):
+def download_pathfinder(root: Path, img_size: int = 32):
+    """Download Pathfinder via HuggingFace datasets."""
+    dest = root / f"pathfinder{img_size}"
+    pt_train = dest / "train.pt"
+    pt_val   = dest / "val.pt"
+    if pt_train.exists() and pt_val.exists():
         print(f"Pathfinder already present at {dest}")
         return dest
+
+    print("  Downloading Pathfinder via HuggingFace datasets ...")
+    ds = _load_hf_dataset("long_range_arena", "pathfinder32")
+    if ds is None:
+        ds = _load_hf_dataset("conceptofmind/pathfinder32", None)
+    if ds is None:
+        print("  Could not download Pathfinder — will use synthetic data.")
+        return None
+
     dest.mkdir(parents=True, exist_ok=True)
-    prefix = f"lra_release/lra_data/pathfinder{img_size}/curv_contour_length_14/"
-    n = _stream_extract(LRA_RELEASE_URL, prefix, dest)
-    print(f"  Pathfinder{img_size}: {n} files -> {dest}")
-    return dest
+    for hf_split, fname in [("train", pt_train), ("validation", pt_val)]:
+        if hf_split not in ds:
+            continue
+        seqs, labels = [], []
+        for row in ds[hf_split]:
+            inp = row.get("input_ids", row.get("input", []))
+            if isinstance(inp, list):
+                ids = [int(x) for x in inp[:img_size * img_size]]
+            else:
+                ids = [int(x) for x in str(inp).split()][:img_size * img_size]
+            ids += [0] * (img_size * img_size - len(ids))
+            seqs.append(ids)
+            labels.append(int(row.get("label", row.get("labels", 0))))
+        torch.save({"seqs":   torch.tensor(seqs,   dtype=torch.long),
+                    "labels": torch.tensor(labels, dtype=torch.long)}, fname)
+        print(f"  Saved {fname.name} ({len(seqs)} samples)")
+
+    return dest if (pt_train.exists() and pt_val.exists()) else None
 
 
 def prepare_imdb_bytes(root: Path, seq_len: int = 4096) -> Path:
@@ -483,6 +524,19 @@ class PathfinderSynthetic(Dataset):
 
 
 def load_pathfinder_real(data_dir: Path, split: str, img_size: int) -> Dataset:
+    """Load Pathfinder from HuggingFace-downloaded .pt files."""
+    fname = {"train": "train.pt", "val": "val.pt", "test": "val.pt"}[split]
+    data  = torch.load(data_dir / fname, weights_only=True)
+    seqs, labels = data["seqs"], data["labels"]
+
+    class _DS(Dataset):
+        def __len__(self): return len(seqs)
+        def __getitem__(self, i): return seqs[i], labels[i]
+    return _DS()
+
+
+def _load_pathfinder_real_png(data_dir: Path, split: str, img_size: int) -> Dataset:
+    """Legacy loader for raw PNG format from the original LRA release."""
     import numpy as np
     from PIL import Image as PILImage
 
@@ -655,12 +709,11 @@ def main():
         text_dir = prepare_imdb_bytes(args.data_root, seq_len=4096)
 
     if "pathfinder" in args.tasks and not args.no_download_pathfinder:
-        print("\n=== Pathfinder32 data (large download) ===")
+        print("\n=== Pathfinder32 data ===")
         pathfinder_dir = download_pathfinder(args.data_root, img_size=32)
     elif "pathfinder" in args.tasks:
-        # Check if already downloaded
-        candidate = args.data_root / "pathfinder32" / "curv_contour_length_14"
-        if candidate.exists() and any(candidate.rglob("*.png")):
+        candidate = args.data_root / "pathfinder32"
+        if (candidate / "train.pt").exists():
             pathfinder_dir = candidate
 
     print()
@@ -703,14 +756,13 @@ def main():
     if "pathfinder" in args.tasks:
         img_size = 32
         seq_len  = img_size ** 2
-        if pathfinder_dir and pathfinder_dir.exists() and any(pathfinder_dir.rglob("*.png")):
-            print(f"Loading real Pathfinder (img={img_size}x{img_size}) ...")
+        if pathfinder_dir and (pathfinder_dir / "train.pt").exists():
+            print(f"Loading real Pathfinder ...")
             pf_tr = load_pathfinder_real(pathfinder_dir, "train", img_size)
             pf_vl = load_pathfinder_real(pathfinder_dir, "val",   img_size)
             data_sources["Pathfinder"] = "real"
         else:
             print("WARNING: Pathfinder data not found, using synthetic fallback.")
-            print("  Re-run without --no-download-pathfinder to get real data.")
             pf_tr = PathfinderSynthetic(size=2000, img_size=img_size, seed=1)
             pf_vl = PathfinderSynthetic(size=500,  img_size=img_size, seed=77)
             data_sources["Pathfinder"] = "synthetic"
