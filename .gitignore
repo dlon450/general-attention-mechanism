@@ -418,3 +418,18 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+# --- experiment artifacts (RESULTS.md writeup) ---
+data/
+results_smoke/
+results_sweep/
+results_cifar_repkey/
+needle_results/
+redundancy_results/
+f2_results/
+f2_needle_power/
+baseline_results/
+baseline_results2/
+*.pt
+*.err
+__pycache__/

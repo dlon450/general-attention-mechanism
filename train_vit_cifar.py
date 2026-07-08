@@ -24,6 +24,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from general_attention import GeneralAttention, GibbsConfig
+from gated_attention import GatedSoftmaxAttention
 
 
 CIFAR_MEAN = (0.4914, 0.4822, 0.4465)
@@ -209,11 +210,24 @@ class TransformerBlock(nn.Module):
         general_bias: bool,
         use_learned_tau: bool,
         tau_init: float,
+        gated_beta_init: float = 0.0,
+        gated_repulsion: bool = False,
+        gated_lambda_init: float = 0.0,
     ):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         if attention_type == "mha":
             self.attn = MHASelfAttention(dim, num_heads, attn_dropout, dropout)
+        elif attention_type == "gated":
+            self.attn = GatedSoftmaxAttention(
+                dim,
+                num_heads,
+                proj_dropout=dropout,
+                attn_dropout=attn_dropout,
+                beta_init=gated_beta_init,
+                repulsion=gated_repulsion,
+                lambda_init=gated_lambda_init,
+            )
         elif attention_type == "general":
             self.attn = GeneralSelfAttention(
                 dim=dim,
@@ -268,6 +282,9 @@ class TinyViT(nn.Module):
         general_bias: bool,
         use_learned_tau: bool,
         tau_init: float,
+        gated_beta_init: float = 0.0,
+        gated_repulsion: bool = False,
+        gated_lambda_init: float = 0.0,
     ):
         super().__init__()
         self.patch_embed = PatchEmbed(
@@ -302,6 +319,9 @@ class TinyViT(nn.Module):
                     general_bias=general_bias,
                     use_learned_tau=use_learned_tau,
                     tau_init=tau_init,
+                    gated_beta_init=gated_beta_init,
+                    gated_repulsion=gated_repulsion,
+                    gated_lambda_init=gated_lambda_init,
                 )
                 for _ in range(depth)
             ]
@@ -310,6 +330,13 @@ class TinyViT(nn.Module):
         self.head = nn.Linear(embed_dim, num_classes)
 
         self.apply(self._init_weights)
+        # Fairness fix: the generic _init_weights pass above clobbers nn.MultiheadAttention's
+        # out_proj (a NonDynamicallyQuantizableLinear subclass of nn.Linear) with
+        # trunc_normal(0.02). Restore PyTorch's standard MHA init so the dense baseline is
+        # the real, tuned baseline rather than a hobbled one.
+        for m in self.modules():
+            if isinstance(m, nn.MultiheadAttention):
+                m._reset_parameters()
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
         nn.init.trunc_normal_(self.cls_token, std=0.02)
 
@@ -355,10 +382,18 @@ def build_dataloaders(
     try:
         import torchvision
         from torchvision import transforms
-    except ModuleNotFoundError as exc:
-        raise RuntimeError(
-            "torchvision is required. Install with: pip install torchvision"
-        ) from exc
+    except ModuleNotFoundError:
+        log("[setup] torchvision unavailable -> using dependency-free local CIFAR loader")
+        from cifar_data import build_dataloaders_local
+
+        return build_dataloaders_local(
+            dataset_name=dataset_name,
+            data_dir=data_dir,
+            batch_size=batch_size,
+            eval_batch_size=eval_batch_size,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+        )
 
     log(f"[setup] preparing transforms for dataset={dataset_name}")
     train_transform = transforms.Compose(
@@ -635,7 +670,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-dir", type=Path, default=Path("./data"))
     parser.add_argument("--download", action="store_true")
 
-    parser.add_argument("--attention", choices=["mha", "general"], default="general")
+    parser.add_argument("--attention", choices=["mha", "general", "gated"], default="general")
+    parser.add_argument(
+        "--gated-beta-init",
+        type=float,
+        default=0.0,
+        help=(
+            "Initial gate temperature beta for --attention gated. 0.0 => starts as EXACT "
+            "dense attention (parity proof), but tau/repulsion grads are frozen at init "
+            "(sticky-parity). Use a small positive value (e.g. 0.5) for win experiments so "
+            "the gate is live from step 0."
+        ),
+    )
+    parser.add_argument(
+        "--gated-repulsion",
+        action="store_true",
+        help="Enable the Phase-B DPP-style anti-redundancy term in --attention gated.",
+    )
+    parser.add_argument(
+        "--gated-lambda-init",
+        type=float,
+        default=0.0,
+        help=(
+            "Initial repulsion strength lambda for --gated-repulsion. 0.0 starts it ~off "
+            "(may stay off); use a positive value (e.g. 1.0) to make repulsion active from step 0."
+        ),
+    )
     parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto")
     parser.add_argument("--seed", type=int, default=346511053)
 
@@ -825,6 +885,9 @@ def main() -> None:
         general_bias=args.general_bias,
         use_learned_tau=not args.disable_learned_tau,
         tau_init=args.tau_init,
+        gated_beta_init=args.gated_beta_init,
+        gated_repulsion=args.gated_repulsion,
+        gated_lambda_init=args.gated_lambda_init,
     ).to(device)
     log("[setup] model built and moved to device")
 
