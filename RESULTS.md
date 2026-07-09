@@ -549,3 +549,29 @@ domain (MUSK, Camelyon, RAMDocs, Byzantine-FL). rep is a genuine *methods/theory
 (unified differentiable determinantal gate + Θ(m)→Θ(log m) separation + adaptive-λ) that wins in
 controlled adversarial-redundancy, ties/loses to specialized methods on real data. Honest scope,
 solid conference paper — not a spotlight empirical-win.
+
+### 14.2 Why rep fails (instrumented) — it is an outlier-KEEPER, not an outlier-remover
+
+`byzantine_diag.py` logs the weight rep actually assigns to honest vs Byzantine workers on real
+CIFAR gradients (uniform = 1/16 = 0.0625; a good defense wants ~0 on byz):
+
+| attack | rep w_honest | rep w_byz | verdict |
+|---|---|---|---|
+| none | 0.061 | 0.066 | mild clean penalty (up-weights the distinct, not the consensus) |
+| signflip | 0.091 | 0.0002 | ✓ suppresses byz (they dominate the aggregate by magnitude) |
+| alie | 0.090 | 0.003 | ✓ suppresses byz |
+| ipm | 0.036 | **0.122** | ✗ AMPLIFIES byz |
+| adaptive_rep | 0.055 | **0.080** | ✗ more weight on byz than honest |
+
+rep's signal is "down-weight alignment with the aggregate", which flags attackers ONLY when they
+dominate the aggregate (large magnitude / majority). A norm-bounded MINORITY attack pointing away
+from the honest consensus makes the aggregate point at HONEST → rep flags honest as redundant and
+KEEPS the attackers. Learning/adapting λ cannot fix this — the *sign* of the signal is wrong for
+minority-attacker robustness.
+
+**Crisp scope (the cleanest statement of the whole project, backed by weights):** rep is an
+outlier-KEEPER (down-weights the dense/aligned majority, up-weights distinct/isolated points). It
+wins iff the *misleading* content is the redundant majority (adversarial duplicates dominating by
+count); it loses/hurts when the *useful* signal is the majority — the normal case in real tasks.
+This is why every real dataset failed (truth = majority = what rep suppresses) and only constructed
+adversarial-redundancy tasks won.
