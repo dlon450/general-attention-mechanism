@@ -182,3 +182,84 @@ $V code_fingerprint.py          # within-context redundancy of real code vs task
 Key files: `gated_attention.py` (mechanism), `MATH.md` (derivation), `f2_sweep.py` (F2 families +
 sparsemax/entmax baselines + tasks), `synthetic_{needle,redundancy}.py`, `code_fingerprint.py`,
 `train_vit_cifar.py` (`--attention gated [--gated-beta-init --gated-repulsion --gated-lambda-init]`).
+
+---
+
+## 11. Real-image validation: MNIST-bags MIL vs SOTA
+
+Multiple-Instance-Learning on **real MNIST images** (`mil_mnist.py`, `mil_abmil.py`): a "bag"
+of digit images with one bag label; a CLS/pooling query attends over per-image embeddings.
+All methods share one backbone (encoder + gated-ABMIL scorer + head) so only the pooling
+differs — parameter-matched. Redundancy bags = `n_sig` distinct class-y images + one class-y'
+image copied `m` times (adversarial clique) + background; label = class with more DISTINCT
+instances. Needle bags = 1 signal among N-1 diverse distractors. `--attn rep` uses a λ-warmup
+(repulsion off for the first 40% of steps so the encoder learns first — active-λ-at-init
+otherwise corrupts the encoder → chance).
+
+**REDUNDANCY (5 seeds, 2500 steps, chance=10%):**
+
+| method | acc mean±std | eval loss | Δ vs Gated-ABMIL |
+|---|---|---|---|
+| Gated-ABMIL [Ilse'18] (SOTA) | 24.16 ±1.16 | 2.159 | — |
+| AEM [2024] (SOTA anti-concentration) | 10.91 ±1.94 | 2.289 | −13.25 (t=−11.7) |
+| sparsemax | 28.20 ±1.67 | 2.068 | +4.05 |
+| entmax-1.5 | 23.02 ±2.63 | 2.161 | −1.14 |
+| dedup (cheap defense, keep 1/near-dup group) | 33.98¹ | 1.691 | +9.8 |
+| count-norm voting (cheap defense) | 33.75¹ | 1.662 | +9.6 |
+| **rep (OURS)** | **71.23 ±10.33** (79.7¹) | **0.911** | **+47.1 (t=9.1)** |
+
+¹ single-seed (the 5-seed dedup grid was blocked by stuck uninterruptible-state GPU procs; the
+gap is unambiguous regardless — same-seed rep 79.7 vs dedup 34.0 ≈ 2.3×).
+
+Our worst seed (53.5) beats Gated-ABMIL's best (25.9). **NEEDLE (benign):** all tied ~39.8
+(rep +0.16, t=0.24) — no false win.
+
+Key notes:
+- **The cheap defenses do NOT match us** (rebuts the #1 reviewer objection): dedup / count-norm
+  voting reach only ~34% vs rep ~72–80%. They remove the *count* advantage, but the residual
+  "pick the class with more distinct instances" is still hard for ABMIL pooling, and a single
+  high-relevance decoy still wins per-instance attention; rep's soft, end-to-end repulsion
+  handles both. (Caveat: the task label *is* distinct-count, so dedup is a natural oracle-ish
+  defense — that it still underperforms by ~2× is the notable result.)
+- **AEM fails (chance)** because entropy-maximization spreads attention onto the numerous clique
+  — the wrong direction.
+- rep has **high variance** (±10.3, λ-warmup-sensitive). This is a *custom* adversarial-redundancy
+  construction, not a standard leaderboard task.
+
+## 12. Why repulsion wins (mechanism)
+
+Softmax, per-token gates, and sparse attention are all **first-order**: a token's weight
+depends only on its own relevance `a_i`. So `m` near-identical tokens each get weight ∝ `e^{a_i}`
+and **together grab `m·e^{a}` — mass grows with count.** No first-order operator escapes this:
+sparsemax truncates *low*-relevance tokens but the clique is *high*-relevance (kept, and the
+background it removes concentrates *more* mass on the clique); AEM pushes toward *uniform*,
+which is pure count-voting → clique dominates → chance.
+
+Repulsion is the only mechanism that reads **second-order** (token–token) structure:
+`g_i = σ(β(a_i − τ − λ r_i))`, `r_i = ⟨k_i, Σ_j g_j k_j⟩`. A clique member is similar to all its
+clones (and to the aggregate it dominates) → `r_i ≈ λ·m·‖k‖²` → its gate is suppressed **more as
+the clique grows**, capping the clique's total mass to ≈ one distinct token. Distinct signal
+tokens have small `r_i` → kept. Net: **repulsion converts voting-by-count into
+voting-by-distinct-content** — the exact information a first-order operator structurally cannot
+see. (rep_val targets redundancy in *values* = what corrupts the output; rep_key in the routing
+keys; identical copies are redundant in both.)
+
+## 13. Limitations & path to a strong (spotlight-grade) paper
+
+Honest self-review — current state is a clean proof-of-concept, not yet spotlight:
+- **Single, custom, semi-synthetic testbed.** Need wins on ≥2 *standard* real benchmarks
+  (Camelyon16/TCGA MIL with official ABMIL/DSMIL/TransMIL/DTFD; or RAMDocs/ConflictQA with a
+  trained reader).
+- **Cheap-defense baselines** (semantic dedup, self-consistency voting) must be beaten — done
+  here on MNIST-bags (see §11), but must hold on real data.
+- **Nearest cousins not run head-to-head:** DppNet (DPP-marginal-from-keys) and ToMe (same
+  key-redundancy signal).
+- **Fragility:** high variance + hand-tuned λ-warmup; needs a principled schedule + variance control.
+- **No theory:** want a first-order-can't / second-order-can *separation result*, mean-field
+  fixed-point well-posedness (contraction), and the O(n·d) complexity, formalized.
+- **Scope/applicability:** only works when you *train* the attention (not frozen LLMs), so RAG's
+  natural home (frozen readers) is out; the honest deployable home is trainable MIL/set models.
+- **Generality:** one tiny model, small scale; need multiple architectures/scales + a real
+  self-attention Transformer result, and evidence of no-harm on benign data at scale.
+- **Analysis depth:** attention visualizations of clique suppression, the redundancy-scaling
+  curve (gap grows with clique size), λ ablations, over-firing control on benign-corroboration.

@@ -433,3 +433,12 @@ baseline_results2/
 *.pt
 *.err
 __pycache__/
+
+# --- MIL experiment artifacts + MNIST data ---
+mnist_dl_train/
+mnist_dl_test/
+mil_results/
+mil_abmil_results/
+mil_abmil_results5/
+dedup_results/
+_wait_dedup.sh

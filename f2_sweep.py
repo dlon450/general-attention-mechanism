@@ -51,6 +51,9 @@ class F2Attention(nn.Module):
             self.log_coupling = nn.Parameter(torch.full((num_heads,), float(inv)))
         else:
             self.register_parameter("log_coupling", None)
+        # Warmup knob: scales the repulsion term (set 0->1 by a schedule so the encoder can
+        # learn before repulsion engages). Plain attribute (not a parameter); default 1.0.
+        self.rep_scale = 1.0
 
     def coupling(self):
         return F.softplus(self.log_coupling)[None, :, None, None]
@@ -74,11 +77,11 @@ class F2Attention(nn.Module):
             # r_i = <k_i, sum_j g0_j k_j>  (factored O(n^2 d), not O(n^3) Gram)
             m = torch.matmul(g0, k)
             r = torch.matmul(m, k.transpose(-1, -2)) * self.scale
-            logit = base - self.coupling() * r
+            logit = base - self.coupling() * self.rep_scale * r
         elif self.f2 == "rep_val":
             m = torch.matmul(g0, v)
             r = torch.matmul(m, v.transpose(-1, -2)) * self.scale
-            logit = base - self.coupling() * r
+            logit = base - self.coupling() * self.rep_scale * r
         elif self.f2 == "submod":
             am = a.amax(dim=-1, keepdim=True)
             ex = torch.exp(a - am)
