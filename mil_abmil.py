@@ -31,9 +31,12 @@ from mil_mnist import Encoder, NUM_CLASSES, load_by_class, make_bag_batch
 
 
 class ABMILPool(nn.Module):
-    def __init__(self, dim, att=128, mode="abmil", beta_init=0.5, lambda_init=1.0):
+    def __init__(self, dim, att=128, mode="abmil", beta_init=0.5, lambda_init=1.0,
+                 mf_iters=1, fixed_lambda=None):
         super().__init__()
         self.mode = mode
+        self.mf_iters = int(mf_iters)          # # mean-field iterations for the repulsion gate
+        self.fixed_lambda = fixed_lambda        # if set, use a FIXED (non-learned) repulsion strength
         self.V = nn.Linear(dim, att)      # gated-ABMIL scorer (shared by ALL modes)
         self.U = nn.Linear(dim, att)
         self.w = nn.Linear(att, 1)
@@ -89,12 +92,15 @@ class ABMILPool(nn.Module):
             earlier = torch.tril(dup, diagonal=-1).any(dim=2)
             w = torch.softmax((a + torch.log(csize)).masked_fill(earlier, float("-inf")), dim=1)
         elif self.mode == "rep":
-            g0 = torch.sigmoid(self.beta * (a - self.tau))            # (B,N)
             Hn = F.normalize(H, dim=-1)
-            m = torch.einsum("bn,bnd->bd", g0, Hn)                    # sum_j g0_j Hn_j
-            r = torch.einsum("bnd,bd->bn", Hn, m)                     # r_k = <Hn_k, m>
-            lam = F.softplus(self.log_lambda) * self.rep_scale
-            g = torch.sigmoid(self.beta * (a - self.tau - lam * r))
+            lam_base = self.fixed_lambda if self.fixed_lambda is not None else F.softplus(self.log_lambda)
+            lam = lam_base * self.rep_scale
+            base = self.beta * (a - self.tau)
+            g = torch.sigmoid(base)                                    # g0
+            for _ in range(self.mf_iters):                            # mean-field iterations
+                m = torch.einsum("bn,bnd->bd", g, Hn)                # sum_j g_j Hn_j
+                r = torch.einsum("bnd,bd->bn", Hn, m)                # r_k = <Hn_k, m>
+                g = torch.sigmoid(base - self.beta * lam * r)
             ex = torch.exp(a - a.amax(dim=1, keepdim=True)) * g
             w = ex / ex.sum(dim=1, keepdim=True).clamp_min(1e-9)
         else:
@@ -106,10 +112,11 @@ class ABMILPool(nn.Module):
 
 
 class ABMILModel(nn.Module):
-    def __init__(self, dim, mode, beta_init=0.5, lambda_init=1.0):
+    def __init__(self, dim, mode, beta_init=0.5, lambda_init=1.0, mf_iters=1, fixed_lambda=None):
         super().__init__()
         self.enc = Encoder(dim)
-        self.pool = ABMILPool(dim, mode=mode, beta_init=beta_init, lambda_init=lambda_init)
+        self.pool = ABMILPool(dim, mode=mode, beta_init=beta_init, lambda_init=lambda_init,
+                              mf_iters=mf_iters, fixed_lambda=fixed_lambda)
         self.head = nn.Linear(dim, NUM_CLASSES)
 
     def forward(self, bags):  # (B,N,784)
@@ -144,6 +151,8 @@ def main():
     p.add_argument("--m-dec", type=int, default=None)
     p.add_argument("--dim", type=int, default=128)
     p.add_argument("--aem-coef", type=float, default=0.1, help="attention-entropy-max weight")
+    p.add_argument("--mf-iters", type=int, default=1, help="mean-field iterations for rep gate")
+    p.add_argument("--fixed-lambda", type=float, default=None, help="fixed (non-learned) repulsion strength")
     p.add_argument("--steps", type=int, default=2500)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--test-batches", type=int, default=20)
@@ -155,7 +164,7 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     torch.manual_seed(args.seed)
     tr = load_by_class("train"); te = load_by_class("test")
-    model = ABMILModel(args.dim, args.mode).to(device)
+    model = ABMILModel(args.dim, args.mode, mf_iters=args.mf_iters, fixed_lambda=args.fixed_lambda).to(device)
     n_params = sum(q.numel() for q in model.parameters())
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     crit = nn.CrossEntropyLoss()

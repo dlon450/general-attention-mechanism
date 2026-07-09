@@ -306,9 +306,15 @@ Honest self-review — current state is a clean proof-of-concept, not yet spotli
 - **Nearest cousins:** ✅ run (§11.2). We beat ToMe decisively; we *match* the exact DPP marginal
   on accuracy (win on compute/differentiability, not significance). A *significant* accuracy win
   over exact DPP is currently blocked by rep's variance (below).
-- **Fragility (now the top open issue):** high variance (±13, λ-warmup-sensitive) — it prevents a
-  significant win over the exact-DPP baseline and inflates error bars. Needs a principled λ
-  schedule + variance control; this is the highest-value remaining fix.
+- **Fragility (top open issue — variance-reduction attempted, UNRESOLVED):** high seed variance
+  (±12–13). It is *optimization/basin* variance (each variant has ~1 bad seed ~45–50 vs the rest
+  ~70–83), **not** estimator variance — the forward is deterministic, so control-variate /
+  antithetic / Rao-Blackwell techniques do **not** apply. Two principled fixes **failed**
+  (`variance_grid.sh`): (i) fixed non-learned λ *hurts* accuracy (38–42 vs 70) and doesn't reduce
+  variance (the model needs to adapt λ per input); (ii) more mean-field iterations (3 vs 1) give
+  no change (70.9 ±13.4 vs 70.2 ±11.7). This variance is what blocks a *significant* win over the
+  exact-DPP baseline. Untried levers: longer training / warmup-schedule sweep / LR &
+  regularization / restart-and-select. A genuine open limitation, documented honestly.
 - **No theory:** want a first-order-can't / second-order-can *separation result*, mean-field
   fixed-point well-posedness (contraction), and the O(n·d) complexity, formalized.
 - **Scope/applicability:** only works when you *train* the attention (not frozen LLMs), so RAG's
