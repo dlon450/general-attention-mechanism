@@ -313,12 +313,80 @@ the rep advantage holds across model width (3 seeds):
 So across the paper the effect is demonstrated over **2 architectures** (self-attention Transformer
 + ABMIL pooling) × **2 modalities** (Gaussian tokens + real MNIST images), robust across scale.
 
-### 11.5 Standard real benchmark: MUSK (in progress)
+### 11.5 Standard real MIL benchmarks (MUSK, Camelyon16) — honest: a tie and a *negative*
 
-MUSK1/MUSK2 (Dietterich et al. 1997) — the canonical real MIL benchmark, 10-fold CV. Setup
-validated: ABMIL 87.9 ±9.2 on MUSK1 (matches the literature). Full rep-vs-baselines comparison
-running (`musk_mil.py`). Honest expectation: MUSK redundancy is *benign* → ~parity with ABMIL
-(a "no-harm on a standard real benchmark" result, not a win).
+Two canonical real MIL benchmarks that other MIL papers report on. Both have redundancy that is
+*benign relative to the label*, so the honest expectation is no-harm/parity, not a win — and one
+of them exposed a genuine failure mode (and its fix, §11.6).
+
+**MUSK1 / MUSK2** (Dietterich et al. 1997), standard 10-fold CV, shared backbone (`musk_mil.py`):
+
+| mode | MUSK1 acc | MUSK2 acc |
+|---|---|---|
+| abmil (Gated-ABMIL) | 87.9 ±9.2 | 89.2 ±7.0 |
+| dedup | 87.9 ±10.5 | 84.2 ±9.1 |
+| dpp (exact) | 87.9 ±9.2 | 89.2 ±5.4 |
+| **rep (ours)** | **87.9 ±9.2** | **87.3 ±10.9** |
+
+→ statistical tie / **no harm on the standard benchmark** (rep's larger MUSK2 spread is the same
+λ-optimization variance addressed in §11.6). ABMIL matches its literature numbers, validating the
+setup.
+
+**Camelyon16** (Owkin Phikon features, standard fixed 269-train / 130-test split, `camelyon_mil.py`),
+metric = test AUC (3 seeds). This is a **needle** task — a slide is positive iff *any* patch is
+tumor — where the positive signal is *itself a redundant clique* (tumor regions span many similar
+patches). So *suppressing* redundancy suppresses the evidence:
+
+| mode | test AUC | test acc |
+|---|---|---|
+| abmil (plain softmax) | **0.946 ±.010** | 89.7 |
+| dedup | 0.925 ±.006 | 88.5 |
+| dpp (exact) | 0.921 ±.016 | 89.0 |
+| **rep — default (λ-init 1, fixed LR)** | **0.858 ±.031** | 82.6 |
+
+`rep` **loses** at the default config, and the damage is monotone in suppression aggressiveness
+(abmil > dpp ≈ dedup > rep). Diagnostic: `rep` kept **learned λ ≈ 0.99** (≈ its init) — it did
+*not* learn to turn itself off, unlike the clean over-firing control (§11.3). Root cause and fix
+in §11.6. **Honest takeaway: our method is not a drop-in for arbitrary MIL — on redundancy-is-
+signal tasks naïve repulsion hurts.**
+
+### 11.6 λ is *learnable* — the optimization fix (and it resolves the variance gap)
+
+The Camelyon negative traced to a single scalar (λ) getting a **weak gradient** under the shared
+base LR + the late λ-warmup: λ barely moved from its init in *either* direction, so it behaved
+like a hyperparameter, not a learned quantity. Fix: give the gate params (λ, τ, β) their **own
+high learning rate** (`--lambda-lr`, a separate optimizer group; base backbone LR unchanged).
+
+**λ becomes genuinely learned and init-independent on adversarial data.** Adversarial-redundancy
+MIL (task=redundancy, 3 seeds), converging to λ ≈ 0.30 from *either* init:
+
+| config | acc | learned λ |
+|---|---|---|
+| abmil | ~25 | — |
+| rep, default (fixed LR) | 71 (needs λ-init 1) / 25 (λ-init 0.1) | stuck at init |
+| **rep + high λ-LR, init 0.1** | **85.6 ±0.5** | 0.1 → **0.29** |
+| **rep + high λ-LR, init 1.0** | **85.7 ±0.5** | 1.0 → **0.30** |
+
+The win now (a) **beats the old fixed-λ result** (85.7 vs 71), (b) is **init-independent** (λ
+converges to ~0.30 regardless of start), and (c) has **near-zero variance** (±0.5).
+
+**And it recovers Camelyon** (redundancy-is-signal), test AUC:
+
+| config | AUC | learned λ |
+|---|---|---|
+| rep, default (λ-init 1, fixed LR) | 0.858 ±.031 | 0.99 (stuck) |
+| **rep + high λ-LR, init 1.0** | **0.917 ±.004** | 0.85 |
+| rep + high λ-LR, init 0.1 | 0.916 ±.034 | wanders {0.13,0.23,1.19} |
+
+Recommended single default = **λ-init 1.0 + high λ-LR**: stable on both regimes (adversarial 85.7
+±0.5, Camelyon 0.917 ±0.004). Residual honesty: on Camelyon `rep` still lands slightly below plain
+softmax (0.917 vs 0.946) — repulsion *cannot* help when redundancy carries the signal; the fix
+just keeps the harm small and the variance tiny.
+
+**This also resolves the top open limitation (§13, variance).** The ±12–13 seed variance was
+largely an *under-optimized-λ* artifact: with a proper λ-LR the adversarial win is 85.7 ±0.5 and
+Camelyon is 0.917 ±0.004. The earlier "fixed-λ fails / more MF-iters fail" conclusions stand — the
+right lever was the λ *learning rate*, not a fixed λ or more inner iterations.
 
 ## 12. Why repulsion wins (mechanism)
 
@@ -341,23 +409,31 @@ keys; identical copies are redundant in both.)
 ## 13. Limitations & path to a strong (spotlight-grade) paper
 
 Honest self-review — current state is a clean proof-of-concept, not yet spotlight:
-- **Single, custom, semi-synthetic testbed.** Need wins on ≥2 *standard* real benchmarks
-  (Camelyon16/TCGA MIL with official ABMIL/DSMIL/TransMIL/DTFD; or RAMDocs/ConflictQA with a
-  trained reader).
+- **Standard real benchmarks: now run, with an honest split verdict (§11.5).** MUSK1/MUSK2 → tie
+  (no harm). Camelyon16 → naïve `rep` *loses* (0.858 vs 0.946 AUC) because it is a
+  redundancy-is-*signal* needle task; fixed to 0.917 ±.004 by the λ-LR fix (§11.6) but still a hair
+  below plain softmax. **Still missing: a real *win* on a standard benchmark** — the natural target
+  is an adversarial-redundancy setting (RAMDocs/ConflictQA/PoisonedRAG, or YelpZip review-spam) with
+  a trained reader/aggregator, since standard MIL redundancy is benign.
+- **New scope caveat (redundancy-is-signal).** When the label *is* carried by a redundant clique
+  (Camelyon tumor patches), any redundancy-suppressor (rep, dedup, DPP) hurts; rep needs the λ-LR
+  fix to keep the harm small. The method helps only when redundancy is *adversarial*, not when it
+  is the signal.
 - **Cheap-defense baselines** (semantic dedup, self-consistency voting) must be beaten — done
   here on MNIST-bags (see §11), but must hold on real data.
 - **Nearest cousins:** ✅ run (§11.2). We beat ToMe decisively; we *match* the exact DPP marginal
   on accuracy (win on compute/differentiability, not significance). A *significant* accuracy win
   over exact DPP is currently blocked by rep's variance (below).
-- **Fragility (top open issue — variance-reduction attempted, UNRESOLVED):** high seed variance
-  (±12–13). It is *optimization/basin* variance (each variant has ~1 bad seed ~45–50 vs the rest
-  ~70–83), **not** estimator variance — the forward is deterministic, so control-variate /
-  antithetic / Rao-Blackwell techniques do **not** apply. Two principled fixes **failed**
-  (`variance_grid.sh`): (i) fixed non-learned λ *hurts* accuracy (38–42 vs 70) and doesn't reduce
-  variance (the model needs to adapt λ per input); (ii) more mean-field iterations (3 vs 1) give
-  no change (70.9 ±13.4 vs 70.2 ±11.7). This variance is what blocks a *significant* win over the
-  exact-DPP baseline. Untried levers: longer training / warmup-schedule sweep / LR &
-  regularization / restart-and-select. A genuine open limitation, documented honestly.
+- **Fragility (was the top open issue — LARGELY RESOLVED by the λ-LR fix, §11.6):** the ±12–13
+  seed variance was *optimization/basin* variance, **not** estimator variance (forward is
+  deterministic → control-variate / antithetic / Rao-Blackwell do **not** apply). Earlier fixes
+  failed for the right reason: (i) *fixed* non-learned λ hurts (38–42 vs 70); (ii) more mean-field
+  iterations do nothing (70.9 ±13.4 vs 70.2 ±11.7). The actual lever was the λ **learning rate**:
+  λ is a single scalar getting a weak gradient under the shared base LR + late warmup, so it never
+  moved. Giving (λ, τ, β) their own high LR makes λ genuinely learned and **collapses the variance**
+  — adversarial win 85.7 **±0.5** (up from 71), Camelyon 0.917 **±0.004**. Remaining: confirm the
+  fix on the full MNIST-bags SOTA table (§11) and re-test whether it now yields a *significant* win
+  over exact-DPP (previously blocked by this variance).
 - **No theory:** want a first-order-can't / second-order-can *separation result*, mean-field
   fixed-point well-posedness (contraction), and the O(n·d) complexity, formalized.
 - **Scope/applicability:** only works when you *train* the attention (not frozen LLMs), so RAG's

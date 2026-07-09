@@ -450,3 +450,6 @@ musk1_out.txt
 musk1_err.txt
 musk*_out.txt
 musk*_err.txt
+cam_*.txt
+adv_*.txt
+camelyon16/

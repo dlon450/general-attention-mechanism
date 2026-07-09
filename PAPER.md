@@ -76,13 +76,20 @@ on benign data (no over-firing).
 - **5.6 Over-firing control:** majority-by-count task (redundancy legitimate) — rep ≈ ABMIL (~91%),
   no harm. [TABLE]
 
-## 6. Limitations (honest; RESULTS.md §13)
-- **Variance** (±13, optimization/basin) — unresolved; fixed-λ and more mean-field iters both fail;
-  blocks a *significant* win over exact-DPP. (Not estimator variance ⇒ control variates N/A.)
-- **Single real testbed** (semi-synthetic MNIST-bags custom construction) — need standard
-  benchmarks (Camelyon16/TCGA MIL; RAMDocs/ConflictQA RAG). ← biggest remaining gap.
+## 6. Limitations (honest; RESULTS.md §13, §11.5–11.6)
+- **Variance** (±13, optimization/basin) — **largely resolved:** the lever was the λ *learning
+  rate*, not fixed-λ or more mean-field iters (both fail). A separate high LR for (λ,τ,β) makes λ
+  genuinely learned and collapses variance (adversarial 85.7 ±0.5, up from 71; Camelyon 0.917
+  ±0.004). Not estimator variance ⇒ control variates still N/A.
+- **Standard real benchmarks — run, honest split (RESULTS §11.5):** MUSK1/2 → tie (no harm);
+  Camelyon16 → naïve rep *loses* (0.858 vs 0.946 AUC; it's a redundancy-is-*signal* needle task),
+  fixed to 0.917 by the λ-LR fix but still a hair below softmax. **Still no real *win* on a standard
+  benchmark** — target an adversarial-redundancy set (RAMDocs/PoisonedRAG/YelpZip) with a trained
+  reader. ← biggest remaining gap.
+- **New scope caveat:** helps only when redundancy is *adversarial*; when redundancy *is* the
+  signal (Camelyon), any redundancy-suppressor hurts.
 - **Scope:** requires a *trainable* attention (not frozen LLMs); natural home = MIL/set models.
-- **Generality:** one small model/scale; need ≥2 architectures + a real self-attention Transformer.
+- **Generality:** ✅ shown across width (dim 32–256) in a self-attention Transformer (§11.4).
 
 ## 7. Conclusion
 Adversarial redundancy is a real, specific failure of per-token attention; a param-neutral mean-
@@ -99,7 +106,7 @@ harming benign data.
 | real-image MIL vs SOTA + cheap defenses + nearest cousins | ✅ done |
 | scaling figure | ✅ done |
 | over-firing control | ✅ done (3-seed confirming) |
-| **variance control** | ❌ open (both fixes failed) |
-| **standard real benchmark(s)** | ❌ needs data staging (biggest gap) |
-| generality (architectures/scale, real Transformer) | ⬜ partial |
+| **variance control** | ✅ largely resolved (λ-LR fix, §11.6): 85.7 ±0.5 / 0.917 ±0.004 |
+| **standard real benchmark(s)** | 🔶 run: MUSK tie + Camelyon negative→fixed (§11.5); no *win* yet |
+| generality (architectures/scale, real Transformer) | ✅ width 32–256, self-attn Transformer (§11.4) |
 | polished figures + full writeup | ⬜ skeleton only |

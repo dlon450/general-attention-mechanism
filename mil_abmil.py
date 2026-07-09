@@ -152,6 +152,8 @@ def main():
     p.add_argument("--dim", type=int, default=128)
     p.add_argument("--aem-coef", type=float, default=0.1, help="attention-entropy-max weight")
     p.add_argument("--mf-iters", type=int, default=1, help="mean-field iterations for rep gate")
+    p.add_argument("--lambda-init", type=float, default=1.0, help="initial (learned) repulsion strength")
+    p.add_argument("--lambda-lr", type=float, default=None, help="separate high LR for lambda/tau/beta")
     p.add_argument("--fixed-lambda", type=float, default=None, help="fixed (non-learned) repulsion strength")
     p.add_argument("--steps", type=int, default=2500)
     p.add_argument("--batch-size", type=int, default=64)
@@ -164,9 +166,17 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     torch.manual_seed(args.seed)
     tr = load_by_class("train"); te = load_by_class("test")
-    model = ABMILModel(args.dim, args.mode, mf_iters=args.mf_iters, fixed_lambda=args.fixed_lambda).to(device)
+    model = ABMILModel(args.dim, args.mode, lambda_init=args.lambda_init,
+                       mf_iters=args.mf_iters, fixed_lambda=args.fixed_lambda).to(device)
     n_params = sum(q.numel() for q in model.parameters())
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+    if args.mode == "rep" and args.lambda_lr:
+        rep_p = [model.pool.log_lambda, model.pool.tau, model.pool.beta]
+        rep_ids = {id(p) for p in rep_p}
+        base_p = [p for p in model.parameters() if id(p) not in rep_ids]
+        opt = torch.optim.AdamW([{"params": base_p, "lr": args.lr},
+                                 {"params": rep_p, "lr": args.lambda_lr}], weight_decay=0.01)
+    else:
+        opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     crit = nn.CrossEntropyLoss()
     g = torch.Generator().manual_seed(10_000 + args.seed)
     is_rep = args.mode == "rep"
@@ -186,6 +196,8 @@ def main():
         loss.backward(); opt.step()
     if is_rep:
         model.pool.rep_scale = 1.0
+        print(f"[diag seed{args.seed}] learned lambda="
+              f"{F.softplus(model.pool.log_lambda).item():.3f}", file=sys.stderr, flush=True)
     acc, loss, ent = evaluate(model, te, args, device)
     print(json.dumps({"task": args.task, "mode": args.mode, "N": args.N, "seed": args.seed,
                       "params": n_params, "test_acc": round(acc, 3), "test_loss": round(loss, 4),
