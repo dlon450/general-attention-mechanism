@@ -226,6 +226,33 @@ Key notes:
 - rep has **high variance** (±10.3, λ-warmup-sensitive). This is a *custom* adversarial-redundancy
   construction, not a standard leaderboard task.
 
+### 11.1 Scaling: theory ↔ experiment
+
+The separation theorem (`THEORY.md`: first-order clique influence Θ(m); mean-field repulsion
+Θ(log m)) predicts how the clique's gate mass scales with clique size m. Confirmed at both
+operating points:
+
+- **Numerical, fixed moderate λ** (`theory_check.py`): rep clique gate `W ≈ 0.41 + 0.82·ln m`
+  (**R²=0.999**); first-order = m. → the log-m law, exactly.
+- **Trained models, learned λ** (`scaling_figure.py`, 3 seeds):
+
+  | m | ABMIL gate (Σν) | ABMIL acc | rep gate (Σg) | rep acc |
+  |---|---|---|---|---|
+  | 2 | 2.00 | 26% | 1.70 | 65% |
+  | 8 | 8.00 | 26% | 0.86 | 67% |
+  | 16 | 16.00 | 25% | 0.08 | 71% |
+  | 32 | 32.00 | 26% | 0.00 | 71% |
+  | 128 | 128.00 | 25% | 0.00 | 63% |
+
+  - **ABMIL gate = m exactly** (R²=1.0 vs m) — first-order counts every copy → **Θ(m) confirmed**.
+  - **rep gate → 0** — the trained model learns *aggressive* repulsion (stronger than the
+    theoretical log-m; fully eliminates the clique by m≈16).
+  - **Accuracy holds across all m**: rep ~63–71% vs ABMIL flat ~25% (m=4 = one noisy seed).
+
+Net: first-order attention's clique influence is provably and empirically **Θ(m)** (unbounded);
+repulsion **bounds/eliminates** it — log m at the theoretical operating point, →0 at the learned
+one — and the accuracy gap holds at every clique size.
+
 ## 12. Why repulsion wins (mechanism)
 
 Softmax, per-token gates, and sparse attention are all **first-order**: a token's weight

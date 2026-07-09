@@ -79,6 +79,8 @@ class ABMILPool(nn.Module):
             w = ex / ex.sum(dim=1, keepdim=True).clamp_min(1e-9)
         else:
             raise ValueError(self.mode)
+        # stash the (unnormalized) gate for analysis: rep -> g; first-order -> nu==1
+        self.last_gate = g.detach() if self.mode == "rep" else torch.ones_like(w)
         bag = torch.einsum("bn,bnd->bd", w, H)
         return bag, w
 
