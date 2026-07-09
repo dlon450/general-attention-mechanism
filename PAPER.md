@@ -107,6 +107,17 @@ harming benign data.
 | scaling figure | ✅ done |
 | over-firing control | ✅ done (3-seed confirming) |
 | **variance control** | ✅ largely resolved (λ-LR fix, §11.6): 85.7 ±0.5 / 0.917 ±0.004 |
-| **standard real benchmark(s)** | 🔶 run: MUSK tie + Camelyon negative→fixed (§11.5); no *win* yet |
+| **standard real benchmark(s)** | ❌ run, no win: MUSK tie, Camelyon lose→near-tie, RAMDocs poisoning loses to dedup (§11.5–11.8) |
 | generality (architectures/scale, real Transformer) | ✅ width 32–256, self-attn Transformer (§11.4) |
 | polished figures + full writeup | ⬜ skeleton only |
+
+## Honest verdict (2026-07-09)
+No real-data win over cheap defenses (dedup / learned relevance) on any standard benchmark tested
+(MUSK, Camelyon16, RAMDocs native + exact/paraphrase poisoning). rep wins only on controlled
+adversarial-redundancy where the legitimate signal is not itself redundant — a conjunction absent
+from these real datasets. **Not a spotlight empirical-win paper.** Defensible framing: a
+methods/theory contribution (unified differentiable determinantal gate nesting softmax/sparse/DPP;
+Θ(m)→Θ(log m) separation theorem; adaptive-λ that resolves the variance issue), i.e. a solid
+conference paper honestly scoped — unless a real domain with the required redundancy structure is
+found (untested: LLM-generated on-topic synonym-paraphrase poison, but embedding-dedup would likely
+match rep there too).

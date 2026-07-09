@@ -388,6 +388,43 @@ largely an *under-optimized-λ* artifact: with a proper λ-LR the adversarial wi
 Camelyon is 0.917 ±0.004. The earlier "fixed-λ fails / more MF-iters fail" conclusions stand — the
 right lever was the λ *learning rate*, not a fixed λ or more inner iterations.
 
+### 11.7 Real RAG conflicting-evidence data (RAMDocs) + poisoning — HONEST NEGATIVE
+
+RAMDocs (Wang et al. 2025), 500 real questions with conflicting/duplicated/noisy retrieved docs.
+
+- **Native RAMDocs is not our regime.** misinfo 0.61 vs correct 3.84 docs/Q; majority-vote-by-count
+  is wrong in only 2% of Qs; the real difficulty is *ambiguity* (400/500 multi-gold). A native run
+  ties — "conflicting-evidence RAG" ≠ "adversarial redundancy".
+- **Retrieval-poisoning stress test** (inject `k` duplicate misinfo copies — the PoisonedRAG threat):
+  - *Surface (hashed-BoW) space* (`ramdocs_poison.py`): `majority` collapses **90.7→0.0** (count-
+    domination confirmed on real text); among *learned* attention rep is the most robust (Δ −7.8 vs
+    softmax −10.9, dpp −11.6); **but hard `dedup` is immune (97.7) and beats rep** — the poison is
+    exact-duplicate, trivially caught by a cosine threshold.
+  - *Semantic space* (real TinyLlama-1.1B embeddings, centered + top-10 removed; `ramdocs_semantic.py`),
+    **paraphrase** poison (50% token-drop → surface-diverse, copy-copy cos 0.76, copy-legit 0.00):
+    softmax **88.4 flat** (learned relevance + poison-augmented training already defends),
+    semantic-dedup **89.9–93.8 flat**, `majority` **→0.0**, and **rep is the WORST learned method
+    (86.0)** — it over-suppresses the legitimately-redundant *correct* docs (multiple correct docs
+    per Q = redundancy-is-signal, cf. Camelyon §11.5).
+- **Verdict: on real RAG data we do NOT beat the cheap `dedup` defense.** Only the pure count-vote
+  rule fails, and that is defended by either learned relevance or a one-line dedup. rep's advantage
+  is confined to controlled adversarial-redundancy where the legitimate signal is *not* itself
+  redundant — a conjunction absent from the standard real benchmarks tested.
+
+### 11.8 Overall real-data scorecard (honest)
+
+| real dataset | rep vs baselines |
+|---|---|
+| MUSK1 / MUSK2 (MIL) | tie (no harm) |
+| Camelyon16 (MIL) | loses at default; λ-LR fix → *near*-tie, still < plain softmax |
+| RAMDocs exact-dup poison | dedup immune & beats rep; rep best only among *soft* methods |
+| RAMDocs paraphrase poison | loses to softmax AND dedup (over-suppresses legit redundancy) |
+
+**We have no real-data win over cheap defenses.** rep's clean wins (§4, §11) are on controlled
+adversarial-redundancy constructions. Honest positioning: this is a **methods/theory** contribution
+(unified differentiable determinantal gate nesting softmax/sparse/DPP; separation theorem; adaptive-λ),
+not an empirical-SOTA-win paper.
+
 ## 12. Why repulsion wins (mechanism)
 
 Softmax, per-token gates, and sparse attention are all **first-order**: a token's weight

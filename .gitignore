@@ -453,3 +453,7 @@ musk*_err.txt
 cam_*.txt
 adv_*.txt
 camelyon16/
+ramdocs*.txt
+ramdocs_emb.npz
+ramdocs_para_emb.npz
+minilm/
