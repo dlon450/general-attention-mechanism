@@ -479,3 +479,34 @@ Honest self-review — current state is a clean proof-of-concept, not yet spotli
   self-attention Transformer result, and evidence of no-harm on benign data at scale.
 - **Analysis depth:** attention visualizations of clique suppression, the redundancy-scaling
   curve (gap grows with clique size), λ ablations, over-firing control on benign-corroboration.
+
+## 14. Byzantine-robust aggregation — a real fit (structure check PASSES)
+
+The recurring blocker on real data was condition 5: truth is usually *corroborated* (redundant), so
+rep suppresses it. Byzantine-robust aggregation *inverts* this cleanly: honest worker updates are
+naturally **diverse** (non-IID shards), while colluding attackers send **correlated** updates to pull
+the aggregate by count. Here suppressing the correlated cluster is exactly right, and honest signal
+is not the redundant one — all five win-conditions hold.
+
+**Structure check** (`byzantine_check.py`, robust-mean estimation, 30 seeds; error =
+‖aggregate − μ‖/‖μ‖, lower better). rep = soft/global repulsion on the update set (down-weight
+updates redundant with the gated aggregate). Baselines: mean, coordinate-median, trimmed-mean, Krum,
+centered-clipping (CClip, Karimireddy'21), and **FoolsGold** (the nearest cousin — a Sybil defense
+that down-weights *pairwise*-similar gradients).
+
+- **Tight collusion** (σ_b=0.05): rep ≈ FoolsGold (tied; FoolsGold slightly better mid-range). Krum
+  is *destroyed* (~6.0 — picks the dense malicious cluster); median/trimmed/CClip degrade with f.
+- **Loose / evasive collusion** (σ_b=1–2, attackers diversify to evade detection): **rep dominates
+  every baseline up to 50% Byzantine** — e.g. σ_b=2, f=0.4: rep **1.61** vs next-best 2.10 (CClip),
+  FoolsGold 2.87 (collapses toward mean — attackers no longer pairwise-similar), Krum 5.7. Principle:
+  FoolsGold keys on *pairwise* similarity (evadable); rep keys on redundancy *with the aggregate*
+  (their collective pull survives individual diversification).
+- **Honest failure boundary:** near-IID honest (σ_b spread ~0.2) *and* very low attack (f≤0.1) →
+  rep slightly over-suppresses the honest consensus; and majority Byzantine (f≥0.6) → beyond standard
+  threat models (Krum survives there by construction).
+
+**Verdict:** first candidate to pass the pre-build structure check, against strong modern defenses,
+in the realistic adaptive/evasive-collusion regime — and adjacent to distributed-training work.
+Caveats before claiming a result: this is robust-*mean* simulation, not real FL; next step is a real
+federated run (real gradients over rounds → final accuracy under attack), adaptive attacks designed
+against rep, and a fuller defense suite (multi-Krum, bucketing, robust momentum).
