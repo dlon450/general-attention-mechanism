@@ -297,6 +297,29 @@ Ablations recap (across the paper): rep_key vs rep_val (synthetic: rep_val 99.3 
 λ=0 (= the `modular` gate ≈ baseline, vs rep +47); warmup on/off (off → chance, active-λ corrupts
 the encoder); variance-reduction (§13: fixed-λ and more mean-field iters both fail).
 
+### 11.4 Generality (architecture + scale)
+
+The win is not an artifact of one tiny model. In a real multi-head **self-attention Transformer**
+(`f2_sweep`, a *distinct* architecture from ABMIL pooling), on synthetic adversarial redundancy,
+the rep advantage holds across model width (3 seeds):
+
+| dim | mha | rep_key | rep_val | Δ(rep_val−mha) |
+|---|---|---|---|---|
+| 32 | 94.5 | 98.0 | 98.1 | +3.6 |
+| 64 | 94.5 | 98.7 | 99.0 | +4.5 |
+| 128 | 93.9 | 98.8 | 99.2 | +5.3 |
+| 256 | 95.6 | 98.6 | 99.0 | +3.4 |
+
+So across the paper the effect is demonstrated over **2 architectures** (self-attention Transformer
++ ABMIL pooling) × **2 modalities** (Gaussian tokens + real MNIST images), robust across scale.
+
+### 11.5 Standard real benchmark: MUSK (in progress)
+
+MUSK1/MUSK2 (Dietterich et al. 1997) — the canonical real MIL benchmark, 10-fold CV. Setup
+validated: ABMIL 87.9 ±9.2 on MUSK1 (matches the literature). Full rep-vs-baselines comparison
+running (`musk_mil.py`). Honest expectation: MUSK redundancy is *benign* → ~parity with ABMIL
+(a "no-harm on a standard real benchmark" result, not a win).
+
 ## 12. Why repulsion wins (mechanism)
 
 Softmax, per-token gates, and sparse attention are all **first-order**: a token's weight

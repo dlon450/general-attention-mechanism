@@ -445,3 +445,8 @@ _wait_dedup.sh
 novelty_results/
 variance_results/
 overfire_results/
+generality_results/
+musk1_out.txt
+musk1_err.txt
+musk*_out.txt
+musk*_err.txt
