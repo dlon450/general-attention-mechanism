@@ -68,6 +68,26 @@ class ABMILPool(nn.Module):
                 csize = dup.sum(dim=2).clamp_min(1).float()
                 w = torch.softmax(a, dim=1) / csize
                 w = w / w.sum(dim=1, keepdim=True).clamp_min(1e-9)
+        elif self.mode == "dpp":
+            # Exact DPP marginal inclusion (DppNet/DPP-A lineage): quality x diversity L-ensemble
+            # L = diag(e^{a/2}) S diag(e^{a/2}), S=key-cosine; marginal K = L(L+I)^{-1}; g_i = K_ii.
+            Hn = F.normalize(H, dim=-1)
+            Ssim = torch.matmul(Hn, Hn.transpose(1, 2))
+            qual = torch.exp(0.5 * (a - a.amax(1, keepdim=True)))
+            Lk = qual.unsqueeze(2) * Ssim * qual.unsqueeze(1)
+            eye = torch.eye(a.shape[1], device=a.device).unsqueeze(0)
+            K = torch.linalg.solve(Lk + eye, Lk)
+            g = torch.diagonal(K, dim1=1, dim2=2).clamp(0.0, 1.0)
+            ex = torch.exp(a - a.amax(1, keepdim=True)) * g
+            w = ex / ex.sum(1, keepdim=True).clamp_min(1e-9)
+        elif self.mode == "tome":
+            # ToMe (as published): merge near-dup clusters, keep 1 rep with PROPORTIONAL attention
+            # (+log cluster-size) — preserves the merged mass, i.e. does NOT drop count-domination.
+            Hn = F.normalize(H, dim=-1)
+            dup = torch.matmul(Hn, Hn.transpose(1, 2)) > self.dedup_thr
+            csize = dup.sum(dim=2).clamp_min(1).float()
+            earlier = torch.tril(dup, diagonal=-1).any(dim=2)
+            w = torch.softmax((a + torch.log(csize)).masked_fill(earlier, float("-inf")), dim=1)
         elif self.mode == "rep":
             g0 = torch.sigmoid(self.beta * (a - self.tau))            # (B,N)
             Hn = F.normalize(H, dim=-1)
@@ -117,7 +137,7 @@ def evaluate(model, cls, args, device):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--mode", choices=["abmil", "aem", "sparsemax", "entmax15", "dedup", "countnorm", "rep"], default="rep")
+    p.add_argument("--mode", choices=["abmil", "aem", "sparsemax", "entmax15", "dedup", "countnorm", "tome", "dpp", "rep"], default="rep")
     p.add_argument("--task", choices=["needle", "redundancy"], default="redundancy")
     p.add_argument("--N", type=int, default=32)
     p.add_argument("--n-sig", type=int, default=3)

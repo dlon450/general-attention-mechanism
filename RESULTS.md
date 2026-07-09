@@ -253,6 +253,30 @@ Net: first-order attention's clique influence is provably and empirically **Θ(m
 repulsion **bounds/eliminates** it — log m at the theoretical operating point, →0 at the learned
 one — and the accuracy gap holds at every clique size.
 
+### 11.2 Head-to-head vs the nearest cousins (novelty)
+
+Redundancy MIL, 3 seeds, shared backbone (`novelty_grid.sh`):
+
+| method | acc ±std | eval loss |
+|---|---|---|
+| ToMe (proportional, ICLR'23) | 17.4 ±0.2 | 2.22 |
+| Gated-ABMIL (SOTA) | 24.9 ±0.8 | 2.16 |
+| ToMe-dedup (no size-weighting) | 34.6 ±1.5 | 1.66 |
+| exact DPP marginal (DppNet / DPP-A lineage) | 61.8 ±0.9 | 0.96 |
+| **rep (ours, mean-field DPP)** | **72.0 ±13.1** | 0.89 |
+
+- **Beat ToMe decisively** (+54.6, t=5.9). ToMe-as-published (proportional attention) *fails*
+  (17% < dense) — its `+log(size)` weighting preserves the count-domination we remove; even
+  ToMe-without-size (dedup, 35%) can't solve the residual.
+- **vs exact DPP marginal: accuracy is a statistical tie** (72 vs 62, Δ+10 but **t=1.09** — rep's
+  variance is high: `[53.5, 79.7, 82.8]` vs DPP's `[60.5, 62.4, 62.5]`; rep wins 2/3 seeds). So the
+  honest advantage over exact DPP is **O(n²d) mean-field vs O(n³) matrix-solve + full
+  differentiability + parameter-neutrality**, *not* a significant accuracy gain. The exact DPP is a
+  strong, stable baseline — which validates the DPP principle the method rests on.
+- **Novelty positioning (defensible):** the mean-field DPP marginal realized as a param-neutral,
+  differentiable, in-softmax gate — cheaper than exact DPP (DppNet/DPP-A) and, unlike ToMe, it
+  *drops* the size-weighting so it actually removes count-domination.
+
 ## 12. Why repulsion wins (mechanism)
 
 Softmax, per-token gates, and sparse attention are all **first-order**: a token's weight
@@ -279,9 +303,12 @@ Honest self-review — current state is a clean proof-of-concept, not yet spotli
   trained reader).
 - **Cheap-defense baselines** (semantic dedup, self-consistency voting) must be beaten — done
   here on MNIST-bags (see §11), but must hold on real data.
-- **Nearest cousins not run head-to-head:** DppNet (DPP-marginal-from-keys) and ToMe (same
-  key-redundancy signal).
-- **Fragility:** high variance + hand-tuned λ-warmup; needs a principled schedule + variance control.
+- **Nearest cousins:** ✅ run (§11.2). We beat ToMe decisively; we *match* the exact DPP marginal
+  on accuracy (win on compute/differentiability, not significance). A *significant* accuracy win
+  over exact DPP is currently blocked by rep's variance (below).
+- **Fragility (now the top open issue):** high variance (±13, λ-warmup-sensitive) — it prevents a
+  significant win over the exact-DPP baseline and inflates error bars. Needs a principled λ
+  schedule + variance control; this is the highest-value remaining fix.
 - **No theory:** want a first-order-can't / second-order-can *separation result*, mean-field
   fixed-point well-posedness (contraction), and the O(n·d) complexity, formalized.
 - **Scope/applicability:** only works when you *train* the attention (not frozen LLMs), so RAG's
