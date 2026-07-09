@@ -69,6 +69,22 @@ def make_bag_batch(data, B, task, N, g, n_sig=3, m_dec=None, device="cpu"):
         sig = _samp(P, y.unsqueeze(1), X, g)                                  # (B,1,784)
         dc = (y.unsqueeze(1) + 1 + torch.randint(0, C - 1, (B, N - 1), generator=g)) % C  # != y
         bag = torch.cat([sig, _samp(P, dc, X, g)], dim=1)                     # (B,N,784)
+    elif task == "majority":
+        # OVER-FIRING CONTROL: two identical-copy cliques (classes y, y') of sizes m1, m2=T-m1;
+        # label = the MAJORITY class BY COUNT. Here redundancy is LEGITIMATE (count is the signal),
+        # so a de-duplicator that always fires would FAIL; rep should learn lambda->0 (no harm).
+        T = 25  # odd -> the two clique sizes always differ
+        m1 = torch.randint(1, T, (B, 1), generator=g)
+        yp = (y + 1 + torch.randint(0, C - 1, (B,), generator=g)) % C
+        by = _samp(P, y.unsqueeze(1), X, g)                                   # (B,1,784)
+        byp = _samp(P, yp.unsqueeze(1), X, g)
+        sel = (torch.arange(T).unsqueeze(0) < m1).unsqueeze(-1)               # (B,T,1)
+        pair = torch.where(sel, by.expand(B, T, 784), byp.expand(B, T, 784))
+        a = torch.minimum(y, yp).unsqueeze(1); b = torch.maximum(y, yp).unsqueeze(1)
+        bc = torch.randint(0, C - 2, (B, 5), generator=g)
+        bc = bc + (bc >= a).long(); bc = bc + (bc >= b).long()
+        bag = torch.cat([pair, _samp(P, bc, X, g)], dim=1)
+        y = torch.where(m1.squeeze(1) > (T - m1.squeeze(1)), y, yp)           # label = majority count
     else:  # redundancy
         m = m_dec if m_dec is not None else N - n_sig - 5
         yp = (y + 1 + torch.randint(0, C - 1, (B,), generator=g)) % C         # decoy class != y

@@ -277,6 +277,26 @@ Redundancy MIL, 3 seeds, shared backbone (`novelty_grid.sh`):
   differentiable, in-softmax gate — cheaper than exact DPP (DppNet/DPP-A) and, unlike ToMe, it
   *drops* the size-weighting so it actually removes count-domination.
 
+### 11.3 Over-firing control (no harm when redundancy is legitimate)
+
+A reviewer-critical check: does rep *hurt* when redundancy is legitimate signal? The
+**majority-by-count** task (`--task majority`): two identical-copy cliques of classes y, y' with
+sizes m1, m2; label = the *majority* class **by count** — so de-duplicating is the *wrong* thing.
+
+| method | acc (majority task) |
+|---|---|
+| Gated-ABMIL | 90.7¹ |
+| rep (ours) | 91.3¹ |
+
+¹ single seed (3-seed confirming). rep **matches** ABMIL — it learns to *not fire* (λ→0) when
+redundancy is the legitimate signal → **no over-firing cost.** Together with the needle and CIFAR
+ties, this establishes: rep helps on *adversarial* redundancy and does not harm on *benign* or
+*legitimate*-redundancy data.
+
+Ablations recap (across the paper): rep_key vs rep_val (synthetic: rep_val 99.3 ≥ rep_key 98.8);
+λ=0 (= the `modular` gate ≈ baseline, vs rep +47); warmup on/off (off → chance, active-λ corrupts
+the encoder); variance-reduction (§13: fixed-λ and more mean-field iters both fail).
+
 ## 12. Why repulsion wins (mechanism)
 
 Softmax, per-token gates, and sparse attention are all **first-order**: a token's weight

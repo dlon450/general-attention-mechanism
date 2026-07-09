@@ -145,7 +145,7 @@ def evaluate(model, cls, args, device):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--mode", choices=["abmil", "aem", "sparsemax", "entmax15", "dedup", "countnorm", "tome", "dpp", "rep"], default="rep")
-    p.add_argument("--task", choices=["needle", "redundancy"], default="redundancy")
+    p.add_argument("--task", choices=["needle", "redundancy", "majority"], default="redundancy")
     p.add_argument("--N", type=int, default=32)
     p.add_argument("--n-sig", type=int, default=3)
     p.add_argument("--m-dec", type=int, default=None)
