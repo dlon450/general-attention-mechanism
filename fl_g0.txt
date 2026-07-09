@@ -1,0 +1,7 @@
+CIFAR FedSGD: N=16 byz-frac=0.3 rounds=200 non-IID alpha=0.5 | cuda
+final test acc (avg last 3 evals), byz=5/16
+
+defense             none     signflip          ipm         alie adaptive_rep
+mean                44.1         10.0         37.2         19.0         10.0
+comedian            33.7         18.8         12.1         19.7         17.3
+trimmed             32.5         20.9         10.6         16.2         16.8
