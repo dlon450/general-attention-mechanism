@@ -510,3 +510,42 @@ in the realistic adaptive/evasive-collusion regime — and adjacent to distribut
 Caveats before claiming a result: this is robust-*mean* simulation, not real FL; next step is a real
 federated run (real gradients over rounds → final accuracy under attack), adaptive attacks designed
 against rep, and a fuller defense suite (multi-Krum, bucketing, robust momentum).
+
+### 14.1 Real federated CIFAR — the structure-check optimism does NOT survive (honest negative)
+
+`fl_byzantine.py`: FedSGD, N=16 non-IID (Dirichlet α=0.5), 30% Byzantine, 200 rounds; server
+aggregates real gradients each round with the full defense suite; attacks are omniscient. The
+decisive `adaptive_rep` attack is norm-bounded (evades clipping) and diversified (evades FoolsGold's
+pairwise-similarity), *crafted to evade rep*.
+
+Final test acc (%), byz=5/16:
+
+| defense | none | signflip | ipm | alie | **adaptive_rep** |
+|---|---|---|---|---|---|
+| mean | 44.1 | 10.0 | 37.2 | 19.0 | 10.0 |
+| comedian | 33.7 | 18.8 | 12.1 | 19.7 | 17.3 |
+| trimmed | 32.5 | 20.9 | 10.6 | 16.2 | 16.8 |
+| krum | 32.0 | 10.5 | 14.1 | 10.5 | **32.2** |
+| cclip | 42.8 | 11.4 | 38.3 | 18.6 | 17.8 |
+| foolsgold | **44.2** | **43.1** | **40.6** | 40.0 | 10.0 |
+| **rep (ours)** | 37.7 | 39.9 | 18.3 | **42.3** | 16.1 |
+
+**Honest verdict: rep does NOT win in real FL.**
+- **Clean penalty**: rep 37.7 vs mean/FoolsGold 44 — rep always represses redundancy, so it costs
+  accuracy even with no attack; FoolsGold gracefully reduces to `mean` when there's no attack.
+- **The adaptive attack crafted against rep succeeds** (rep 16.1, *below* Krum's 32.2) — the
+  make-or-break test, failed. Diversified norm-bounded byz evade rep's redundancy signal.
+- rep wins exactly one column (`alie`, 42.3) and is poor on `ipm` (18.3) and `adaptive_rep`.
+- No defense dominates (Byzantine no-free-lunch): FoolsGold best on none/signflip/ipm; Krum uniquely
+  survives `adaptive_rep`; rep best only on `alie`.
+
+**Why the structure check (§14) was misleading**: the robust-mean simulation used a *fixed* evasive
+attack (rep won); it did not include an *adaptive* attack that reacts to rep. Real FL + an adaptive
+attack refutes the clean-win hypothesis. Lesson recorded: a pre-build structure check must include
+adaptive adversaries.
+
+**Final conclusion for the project**: no real-data win over cheap/standard defenses on ANY tested
+domain (MUSK, Camelyon, RAMDocs, Byzantine-FL). rep is a genuine *methods/theory* contribution
+(unified differentiable determinantal gate + Θ(m)→Θ(log m) separation + adaptive-λ) that wins in
+controlled adversarial-redundancy, ties/loses to specialized methods on real data. Honest scope,
+solid conference paper — not a spotlight empirical-win.
