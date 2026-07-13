@@ -457,3 +457,4 @@ ramdocs*.txt
 ramdocs_emb.npz
 ramdocs_para_emb.npz
 minilm/
+cons_*.txt

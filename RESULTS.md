@@ -628,3 +628,47 @@ provenance channel separates truth — the empirical no-free-lunch for any (V,S)
 robust oracle (within-cluster mean of the noisy graph, which averages out edge noise) is near-perfect
 and graceful in γ. Headline cell for the mechanism study: **α=1, γ=0.8** (oracle 98%, clearly
 non-trivial noise, cheap = chance). This validates the testbed before building mechanisms/baselines.
+
+## 17. E1b — the consensus mechanism study (P1/P2): a real, honestly-scoped win
+
+Shared k=1 self-attention encoder + swappable pooling head -> C logits (predict latent truth),
+matched params. `consensus_models.py`, headline cell alpha=1, gamma=0.8, frozen test, 3 seeds.
+
+**P1 (no-free-lunch, CONFIRMED).** Content-only models sit at chance — regular attention *provably
+cannot* win when content/count are swap-symmetric:
+
+| arm | test acc | params |
+|---|---|---|
+| softmax (content) | 49.2 ±1.2 | 35,908 |
+| Set Transformer (ISAB+PMA, content) | 49.1 ±0.3 | 40,388 |
+
+**P2 (provenance). Accuracy at n=6000:** all provenance arms win (92–96%), but on RAW accuracy our
+mechanism is NOT best — a trivial 1-feature degree-concat beats it:
+
+| arm (provenance) | test acc |
+|---|---|
+| prov_concat (degree feature + softmax) | 95.9 ±0.3 |
+| relation_bias (Pgraph as attn bias) | 94.2 ±0.8 |
+| m2_prov (ours) | 92.2 ±0.3 |
+
+**P2 sample-efficiency (the WIN).** m2_prov's inductive bias dominates in the low-data regime:
+
+| n_train | prov_concat | relation_bias | **m2_prov** |
+|---|---|---|---|
+| 200 | 52.0 | 45.0 | **80.2** |
+| 400 | 59.1 | 46.6 | **83.7** |
+| 800 | 84.4 | 51.8 | **87.6** |
+| 1600 | 94.0 | 82.5 | 89.9 |
+| 3200 | 95.4 | 91.8 | 91.4 |
+
+m2_prov reaches 80% with ~200 bags where the baselines are at chance (~4x fewer bags to 80% than
+prov_concat); baselines catch up/overtake only at high data. Classic useful-inductive-bias signature.
+
+**Honest thesis (defensible, pre-registered):** (1) NO content-only rule — softmax OR Set Transformer
+— beats chance on the mixed multiplicity-vs-corroboration distribution (empirical no-free-lunch);
+(2) a noisy same-source provenance signal is necessary AND sufficient; (3) a source-aware pooling
+*inductive bias* (down-weight within-content-neighbor same-origin density) is far more
+SAMPLE-EFFICIENT at consuming that signal than feeding it to generic attention — while at high data
+the bias becomes unnecessary (baselines match). NOT a raw in-distribution expressivity win.
+MVP scale, 3 seeds, one cell — full protocol (>=10 seeds + paired CIs, worst-case-over-alpha, OOD-cell
+extrapolation, latency) is the next step to lock it.
