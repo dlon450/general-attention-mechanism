@@ -1,183 +1,129 @@
-# When Does Attention Need to Count Distinct? A Mean-Field Determinantal Gate and Its Operating Regime
+# Counting Distinct, Not Total: Provenance-Aware Pooling for Consensus under Adversarial Duplication
 
-*Draft — methods/theory framing. Details/numbers in `THEORY.md`, `MATH.md`, `RESULTS.md`.*
+*Draft — the honest, CI-backed framing. Numbers in `RESULTS.md` (§14–18), theory in `THEORY.md`,
+pre-registration in `PREREG.md`, mechanism math in `MATH.md`.*
 
 ---
 
 ## Abstract
 
-Softmax attention scores each item by its own relevance, so a set of `m` near-identical items
-captures pooled mass proportional to their **count**. We ask when this matters and what to do about
-it. We derive, from a subset-attention view, a **mean-field determinantal gate**: a deterministic,
-differentiable, parameter-neutral term inside the softmax numerator that down-weights an item for
-being redundant *with the rest of the attended set*. The gate **unifies** existing pooling rules —
-softmax, per-token/sparse gates (sparsemax, entmax), and the determinantal-point-process (DPP)
-marginal all arise as special cases — and comes with a **separation theorem**: under a redundant
-clique of size `m`, any *first-order* (per-item) rule lets the clique's influence grow `Θ(m)`, while
-the gate caps it at `Θ(log m)`. We validate the law numerically (`W ≈ 0.41 + 0.82 ln m`, R²=0.999)
-and on trained models. A single high learning rate on the gate's scalars makes its strength **learned
-and init-independent**, which also removes the optimization variance of the sampled precursor.
-Finally, we **characterize the operating regime precisely**, with instrumented evidence: the gate is
-an *outlier-keeper* — it helps exactly when the *misleading* content is the redundant majority, and
-is neutral-to-harmful when the *useful* signal is itself redundant. Across four real domains (MUSK,
-Camelyon16, conflicting-evidence RAG, and Byzantine-robust federated learning) we show this regime is
-narrow in practice, and we explain — with per-item weight measurements — why. The result is a clean
-account of *when diversity-aware pooling is the right inductive bias, and when it is not.*
+Softmax attention scores each item by its own relevance, so `m` near-identical items capture pooled
+mass proportional to their **count**. When multiplicity is adversarial — a single source duplicated to
+outvote independent sources — this is a failure mode, but fixing it is subtle: the *same* multiset of
+`(query, key, value)` could be `m` copies from one source **or** `m` independent corroborating
+sources, and the correct pooling differs. We prove and demonstrate a **no-free-lunch**: on a
+distribution where content and count are swap-symmetric, **no pooling rule that sees only the item
+multiset — softmax, sparse attention, or a Set Transformer — beats chance.** The missing ingredient is
+**provenance** (a possibly-noisy same-source signal). Given it, we introduce a **source-aware gate** —
+a deterministic mean-field pooling term (the descendant of a determinantal/repulsion attention) that
+down-weights items redundant *within their same-origin group*, combined with a zero-initialized
+residual so it starts as a strong low-data prior and relaxes to a flexible high-data solution. On a
+pre-registered benchmark (10 seeds, paired-bootstrap CIs, frozen test), content-only attention is at
+chance while our gate is (i) **far more sample-efficient** than feeding provenance to plain attention
+(paired-CI wins of +6 to +30 points at ≤800 labels), (ii) **at parity at scale**, and (iii) **the most
+robust to an adaptive adversary** (worst-case-over-attack 89.0 vs ≤85.1 for baselines), at **matched
+parameters (+0.2%)** and ~1.7× forward cost. We are explicit about scope: this is an inductive-bias +
+robustness result for consuming provenance, not a universal "better attention"; on standard benchmarks
+without provenance (MUSK, Camelyon16, RAG poisoning, Byzantine-FL) a fixed diversity bias ties or loses
+(§14), exactly as the no-free-lunch predicts.
 
 ## 1. Introduction
 
-Per-item attention (softmax and its sparse variants) is *first-order*: an item's weight depends only
-on its own score. A direct consequence is **count-domination** — `m` near-duplicate items collect
-`Θ(m)` of the pooled mass regardless of how much *distinct* information they carry. When those
-duplicates are misleading (a redundant clique voting for the wrong answer), no first-order rule can
-suppress them, because their count enters linearly and cannot be removed by any per-item function of
-the score.
+Per-item attention is *first-order*: an item's weight depends only on its own score, so a size-`m`
+duplicate clique collects `Θ(m)` of the pooled mass. When that clique is a coordinated adversary
+(Sybil/duplication attack), count-based pooling is fooled. But the deep obstacle is an **identifiability
+gap**: multiplicity and corroboration produce the same item multiset, so *no function of the multiset
+alone* can separate "one source shouting" from "many sources agreeing." Contributions:
 
-We study a second-order alternative and its limits. Contributions:
-
-1. **A unifying mean-field determinantal gate** (§3): a deterministic, differentiable, parameter-
-   neutral term inside softmax that nests softmax (β=0), per-token/sparse gates (λ=0), and the DPP
-   marginal (the mean-field limit) as special cases, at attention-order cost `O(n²d)` (`O(nd)` global).
-2. **A separation theorem** (§4): first-order clique influence is `Θ(m)`; the gate's is `Θ(log m)` —
-   an exponential reduction in effective multiplicity — with a *falsifiable, measured* prediction
-   `W_D ∼ log m`.
-3. **An adaptive-λ training rule** (§5.3): a separate high learning rate on the gate scalars makes
-   the repulsion strength learned and init-independent, and collapses the variance of the sampled
-   precursor.
-4. **A precise operating-regime characterization** (§5.4–5.5): with per-item weight measurements we
-   show the gate is an *outlier-keeper* — it helps iff the misleading content is the redundant
-   majority, and we map, across four real domains, exactly where that holds and where it does not.
-
-We are deliberately explicit that this is a **methods/theory** contribution with a **narrow but
-sharply-characterized** empirical regime, not a new state of the art on a standard benchmark.
+1. **No-free-lunch (§4, §5.1):** a swap-symmetry construction on which any multiset-only pooling rule
+   is exactly chance; confirmed empirically — softmax **and** a Set Transformer sit at chance.
+2. **Provenance as the resolving signal, and a source-aware gate to use it (§3):** a deterministic
+   mean-field pooling gate keyed on same-origin density, with a zero-init residual (rigid prior →
+   flexible). It is the honest, corrected descendant of a determinantal/repulsion attention.
+3. **A pre-registered, CI-backed win (§5):** far more sample-efficient than feeding provenance to
+   plain attention, at parity at scale, and most robust to an adaptive adversary; matched params.
+4. **Honest scope (§6):** without provenance no fixed rule can win; on standard no-provenance
+   benchmarks a diversity bias ties/loses. We report those negatives.
 
 ## 2. Related work
-
-- **Sparse attention** (sparsemax [Martins'16], entmax [Peters'19]): magnitude thresholds on the
-  *score*; they zero low-score items but keep a high-score redundant clique. First-order ⇒ subject to
-  the `Θ(m)` bound (§4). *In our experiments they tie or hurt on redundancy.*
-- **Determinantal attention** (DppNet [NeurIPS'19]; DPP-A [eLife'23]; Kulesza & Taskar): the
-  substrate. Our gate is the **mean-field marginal** of the DPP used *inside* softmax — cheaper
-  (`O(n²d)` vs `O(n³)`) and differentiable. *We match exact-DPP on accuracy at lower cost.*
-- **Token merging / pruning** (ToMe [ICLR'23], DynamicViT): identical key-similarity signal, but
-  merges for efficiency with size-weighted (count-preserving) attention. *We beat ToMe on redundancy.*
-- **Diversity/repulsive attention** (Repulsive Attention [EMNLP'20] = between-head; attention-entropy
-  maximization): a different axis, or the wrong direction (spreading toward uniform = pure count).
-- **Robust aggregation** (Krum, coordinate-median, trimmed-mean, centered-clipping, FoolsGold): §5.4
-  situates the gate against these; the gate is an outlier-*keeper*, so it is *not* a robust aggregator
-  (§5.5).
+- **Sparse attention** (sparsemax, entmax): per-item magnitude thresholds — first-order, subject to
+  the no-free-lunch; at chance here.
+- **Set models** (Set Transformer / ISAB+PMA, DeepSets): expressive multiset functions — but the
+  no-free-lunch is information-theoretic, so a Set Transformer is *also* at chance without provenance.
+- **Determinantal / repulsive attention** (DppNet, DPP-A, ToMe): diversity by key similarity. We use a
+  deterministic mean-field marginal; §4/E0 corrects the true clone-invariant primitive (Θ(1)).
+- **Robust aggregation / Sybil defense** (Krum, coord-median, centered-clipping, FoolsGold): related
+  in spirit; our gate is provenance-conditioned pooling, not a coordinate-space robust mean (§14).
+- **Provenance / attribution in RAG and trust**: motivates the same-source signal.
 
 ## 3. Method
 
-**Subset-attention view.** Write attention as an expectation over attended subsets,
-`y = E_{S∼p(S)}[softmax_S(a)·v]`, with `p(S) ∝ exp(β F₂(S))`. A **modular** `F₂` yields a per-token
-gate (adaptive sparsity); a **non-modular** (pairwise) `F₂` yields a determinantal law. Collapsing
-the sampler to its deterministic **mean-field marginal** gives a per-item gate multiplying the
-softmax numerator:
+**Deterministic mean-field pooling (lineage, not sampling).** The original idea drew subsets
+`S∼p(S)∝exp(βF₂(S))` and averaged (Monte-Carlo) — high-variance and non-differentiable. We collapse
+it to its **deterministic mean-field marginal**: each item gets a closed-form inclusion gate `gᵢ`
+multiplying the softmax numerator, `wᵢ ∝ gᵢ e^{aᵢ}` (no sampling; variance 0; differentiable).
 
-```
-a_i = q·k_i/√d
-g_i = σ( β (a_i − τ(q) − λ · r_i) ),   r_i = ⟨k_i, Σ_j g_j k_j⟩/√d      (factored, O(n²d))
-w_i = g_i e^{a_i} / Σ_j g_j e^{a_j},   y = Σ_i w_i v_i
-```
+**Source-aware gate (ours).** Relevance `aᵢ = q·kᵢ/√d`. From a (noisy) same-source graph `P`, compute
+each item's **within-content-neighbourhood same-origin density** `densᵢ = Σⱼ Cᵢⱼ Pᵢⱼ` (`C` = content-
+similarity weights). A same-source clique has high density; independent corroborators have low density.
+The gate down-weights high density:
+`gᵢ = σ( β(τ − λ·densᵢ) + MLP([densᵢ, degreeᵢ, aᵢ]) )`, with the **MLP zero-initialised** so training
+*starts* as the rigid prior `σ(β(τ−λ·dens))` (maximal sample-efficiency) and *relaxes* into a flexible
+function as data grows (recovers the ceiling). Parity: `λ=0, MLP=0 ⇒ softmax`. Cost: `O(n²d)` (attention
+order); +O(scalars) params.
 
-**Unification (special cases).**
-- `β = 0` ⇒ `g_i ≡ ½` ⇒ **exact softmax** (parity by construction).
-- `λ = 0` ⇒ per-token gate = **adaptive sparsity** (sparsemax/entmax family in spirit).
-- The full fixed point of `g` is the **DPP mean-field marginal** (a soft, differentiable DPP).
+## 4. Theory (`THEORY.md`)
+- **No-free-lunch (Thm):** on the swap-symmetric slice the `(V, source-id)` marginal is invariant under
+  honest↔adversary role swap ⇒ any function of the multiset has Bayes error = chance; only provenance
+  breaks the symmetry.
+- **Corrected clone-invariance (E0, §15):** the shipped one-step gate drives clique mass → 0
+  (over-suppression); the naive fixed point is Θ(log m) but ill-posed past its contraction limit; the
+  **true DPP marginal is Θ(1)** — one effective vote per duplicate group. We drop the earlier
+  "Θ(log m)" and "nests DPP" claims and use the corrected primitive.
+- **Complexity:** `O(n²d)` per query (attention order), `O(nd)` for a global gate.
 
-**Properties** (verified, §5.1): nests softmax to `7.5e-8`; deterministic (output variance `0`, vs
-the sampled precursor's `0.955`); **parameter-neutral** (+`dim+2H` scalars, ~0.13% of an MHA layer);
-differentiable in `β, τ, λ`. A short λ-warmup avoids corrupting a jointly-trained encoder at init.
+## 5. Experiments (pre-registered; `PREREG.md`, 10 seeds, paired-bootstrap CIs, frozen test)
 
-## 4. Theory (see `THEORY.md`)
+Benchmark: consensus-under-adversarial-duplication (`task_consensus.py`) — two content clusters matched
+in #items / #surface-ids / content spread, differing only in true-origin structure (honest = many
+independent origins; Sybil = one origin over many surface ids), revealed via a noisy same-origin graph.
+Non-gameability gate passes (cheap content/count baselines = chance; oracle 98%).
 
-**Setup.** A pooling query over `n` distinct signal items and a clique of `m` identical copies (self-
-affinity `s`). Correctness needs the clique's mass ratio `ρ < 1`.
+- **5.1 No-free-lunch (H1):** at α=1, `softmax` 48.6→50.2 and `set_transformer` 35→49 across
+  n∈[200,6000] — content-only is at chance. Regular attention cannot win. [TABLE §18]
+- **5.2 Sample-efficiency (H2, headline):** paired Δ(m2_prov_r − prov_concat) = **+29.6** [28.5,30.7] @
+  n=200, **+24.7** @400, **+6.3** [3.6,8.7] @800 (CI-significant wins); parity at the ceiling (n≥3200);
+  one negligible −0.6 dip @1600. Large win when labels are scarce, no cost at scale. [FIG: learning curve]
+- **5.3 Robustness (H3, clean win):** worst-case-over-α (adaptive adversary) — m2_prov_r **89.0** vs
+  prov_concat 85.1, relation_bias 51.3 (collapses at α=1), softmax 49.9. Most robust. [TABLE §18]
+- **5.4 Ablation (bias–variance):** rigid gate (max sample-efficiency, capped ceiling) vs MLP gate
+  (recovers ceiling, needs data) vs rigid+residual (best of both). [§17.1]
+- **5.5 Latency / params:** +0.2% params, ~1.7× forward, fwd+bwd comparable. [TABLE §18]
+- **5.6 OOD:** train small-clusters → test large-clusters ties (shift makes it easier); reported
+  honestly as non-differentiating.
 
-- **Thm 1 (Separation).** *(a)* Any first-order gate `ν_i = φ(a_i)` gives `ρ = Θ(m)` — the count
-  enters linearly and is unremovable by any `φ`; the clique dominates once it is a constant factor
-  larger than the signal. *(b)* The mean-field gate gives clique mass `W = Σ_{i∈D} g_i = Θ(log m /
-  βλs)`, hence `ρ_rep = Θ(log m / n)`; correct up to `m ≈ e^{Θ(n)}`.
-- **Prop 2 (Well-posedness).** The mean-field map is a contraction for `βλ‖K‖_∞ < 4` ⇒ a unique,
-  geometrically-convergent fixed-point gate.
-- **Prop 3 (Complexity).** `O(n²d)` per-query (attention order; ~2× constant), `O(nd)` for a global
-  gate. No `O(n³)` Gram.
-- **Falsifiable prediction.** `W_D(m) ∼ m` (softmax) vs `∼ log m` (rep), directly measurable.
-
-## 5. Experiments
-
-### 5.1 Property verification & parity
-`gated_attention.py`/`verify_gated_parity.py`: nests softmax (7.5e-8), deterministic (0.0), param
-delta = `dim+2H` exactly. **CIFAR-10** TinyViT, 5 seeds, dropout-matched: MHA 83.95 vs gated+rep
-84.00 (all Welch |t|<1.5) — **no harm on benign data.**
-
-### 5.2 Controlled adversarial redundancy (where it wins) + the scaling law
-Two self-contained testbeds where a misleading clique dominates by count.
-- **Synthetic redundancy** (3 seeds): rep_val **99.26**, rep_key 98.80 vs entmax 96.21, modular
-  96.87, dense 95.27, sparsemax 85.81. Ordering: **repulsion ≫ gate/entmax ≫ dense ≫ sparsemax.**
-- **Real-image MNIST-bags MIL** (shared backbone, 5 seeds): rep **71.2** vs Gated-ABMIL 24.2, AEM
-  10.9 (chance), sparsemax/entmax 23–28, cheap dedup/vote ~34; nearest cousins: exact-DPP 62 (tie on
-  acc, win on `O(n²d)` cost), ToMe 17. Needle (no redundancy): ties.
-- **Scaling law [key figure]:** trained ABMIL clique gate grows `∝ m` (R²=1.0); rep → 0. Measured
-  `W ≈ 0.41 + 0.82 ln m` (R²=0.999) — the predicted `log m` law; 559× suppression at m=4096.
-- **Generality:** the redundancy win holds across width (dim 32–256, Δ +3.4–5.3) in a self-attention
-  Transformer (second architecture).
-
-### 5.3 Adaptive λ (learnable strength; resolves variance)
-The sampled precursor and fixed-λ variants had high seed variance (±12–13). The lever is the λ
-**learning rate**: a separate high LR on `(λ,τ,β)` makes λ **learned and init-independent** (converges
-to ~0.30 from either init on adversarial data) — adversarial accuracy **85.7 ±0.5** (up from 71), and
-on a redundancy-is-signal task variance collapses (0.917 **±0.004**). Fixed-λ and more mean-field
-iterations both fail; the right lever was optimization, not the estimator.
-
-### 5.4 Operating regime across four real domains (honest scorecard)
-Using real data + standard threat models where applicable:
-
-| domain | setup | outcome for the gate |
-|---|---|---|
-| MUSK1/2 (MIL) | 10-fold CV | **tie** (no harm) |
-| Camelyon16 (MIL) | Phikon feats, std split | **loses** at default (0.858 vs softmax 0.946 AUC); adaptive-λ → 0.917 (near-tie). It is a *redundancy-is-signal* needle task. |
-| RAMDocs (RAG) | native + injected poisoning | native = tie (not count-dominated); under poisoning, **cheap dedup / learned relevance win**; gate hurts (over-suppresses redundant *correct* docs) |
-| Byzantine-FL (CIFAR) | FedSGD, adaptive attack | **loses**; an attack crafted to evade it drops it below Krum |
-
-**Takeaway:** no standard-benchmark win. The regime where the gate helps (misleading content is the
-redundant majority *and* the useful signal is not itself redundant) is **narrow in practice**.
-
-### 5.5 Why — the gate is an outlier-*keeper* (instrumented)
-`byzantine_diag.py` measures the weight the gate assigns to honest vs adversarial items (uniform
-0.0625). It suppresses adversaries only when they dominate the aggregate (large-magnitude attack:
-w_adv ≈ 0.0002); against a *norm-bounded, diversified minority* it **amplifies** them (w_adv 0.08–0.12
-> w_honest 0.04–0.06), because with honest items in the majority the aggregate points at the honest
-consensus and the gate flags *that* as redundant. This is the mechanism, not a tuning artifact:
-inverting the sign for robustness merely reproduces mean-shift/median. It also explains 5.4 — in real
-tasks the useful signal is usually the (redundant) majority, exactly what the gate down-weights.
-
-## 6. Scope & limitations (stated as a result)
-
-> **The gate is a diversity/decorrelation operator: it down-weights the dense/aligned majority and
-> keeps distinct/isolated items. It is therefore the right inductive bias iff the *misleading*
-> content is the redundant majority, and the wrong one when the *useful* signal is the majority.**
-
-- Requires a *trainable* attention (not a frozen-LLM inference patch); natural home = MIL / set models.
-- Not a robust aggregator (outlier-keeper, not remover); §5.5.
-- One small model scale; theory is for the clean clique model (extends qualitatively).
+## 6. Scope & limitations (stated as results)
+- **Provenance is required.** Without it, the no-free-lunch bites: on standard benchmarks with no
+  same-source signal (MUSK tie, Camelyon16 lose→near-tie, RAMDocs poisoning loses to dedup,
+  Byzantine-FL loses to Krum under adaptive attack; §11–14) a fixed diversity gate ties or loses — it
+  is an *outlier-keeper*, useful only when the misleading content is the redundant majority (§14.2).
+- **Not a high-data expressivity win.** At scale a flexible model matches us; the contribution is
+  sample-efficiency + robustness (an inductive bias), not universal superiority.
+- **Scale/scope:** one MVP model size and one task family; requires trainable attention.
 
 ## 7. Conclusion
-
-Count-domination is a real, provable failure mode of per-item attention. A mean-field determinantal
-gate fixes it — provably (`Θ(m)→Θ(log m)`), unifying softmax/sparse/DPP, at attention-order cost,
-learnable via a single LR, and without harming benign data. Its benefit is real but **precisely
-bounded**: it helps when distinctness (not count) should decide, and we give the theory, the
-measured scaling law, and instrumented evidence for exactly when that is — and is not — the case.
+Multiplicity vs. corroboration is an irreducible ambiguity for multiset pooling — provably unlearnable
+from content alone. Given a (noisy) provenance signal, a deterministic source-aware pooling gate uses
+it more sample-efficiently and more robustly than feeding it to generic attention, at matched cost —
+while, without provenance, no fixed rule can help. The honest boundary is the result.
 
 ---
 
-### Artifact / repro
-`gated_attention.py`, `f2_sweep.py`, `mil_abmil.py`, `mil_mnist.py`, `scaling_figure.py`,
-`theory_check.py`, `camelyon_mil.py`, `musk_mil.py`, `ramdocs_*.py`, `byzantine_check.py`,
-`fl_byzantine.py`, `byzantine_diag.py`; full logs in `RESULTS.md`, proofs in `THEORY.md`.
-
-### Status
-Draft prose complete; needs: polished figures (mechanism schematic, `W∼log m` curve, scaling
-accuracy), formal proof write-ups from `THEORY.md`, and a final pass on baselines/citations.
+### Status / to finalize
+- Figures: learning-curve with CIs, worst-case-over-α bar, mechanism schematic.
+- Formalize the no-free-lunch and E0 corrections in `THEORY.md`.
+- Scale check (larger model / a second task family) to test whether the sample-efficiency + robustness
+  edge persists; citations/baselines pass.
+### Artifacts
+`task_consensus.py`, `consensus_models.py`, `bench_full.py`, `aggregate.py`, `clique_scaling.py`,
+`tests/test_nongameability.py`, `PREREG.md`; full logs `RESULTS.md`, proofs `THEORY.md`.
