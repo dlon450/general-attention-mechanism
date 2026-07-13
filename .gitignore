@@ -458,3 +458,6 @@ ramdocs_emb.npz
 ramdocs_para_emb.npz
 minilm/
 cons_*.txt
+results_full/
+smoke_full.jsonl
+*.jsonl
