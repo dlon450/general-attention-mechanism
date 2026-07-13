@@ -575,3 +575,32 @@ wins iff the *misleading* content is the redundant majority (adversarial duplica
 count); it loses/hurts when the *useful* signal is the majority — the normal case in real tasks.
 This is why every real dataset failed (truth = majority = what rep suppresses) and only constructed
 adversarial-redundancy tasks won.
+
+## 15. E0 — theory/implementation reconciliation (reviewer's central math claim: CONFIRMED)
+
+`clique_scaling.py`: total gate mass W_m of a size-m identical clique (+ n=8 distinct signal keys),
+under three gates (β=1, λ=0.5, τ=0):
+
+| m | one-step (shipped) | fixed-point (THEORY.md) | true DPP marginal |
+|---|---|---|---|
+| 4 | 1.59 | 2.03 | 0.91 |
+| 32 | 0.0008 | 5.34 | 0.99 |
+| 256 | 0.000 | 12.5 | 1.00 |
+| 4096 | 0.000 | 21.1 | 1.00 |
+
+- **One-step gate (what `gated_attention.py` ships)** → W_m **collapses to 0** (the `m·e^{-cm}` shape:
+  peaks at m≈4 then crashes). Our trained "clique gate → 0" observation validates *this one-step rule*,
+  NOT the Θ(log m) theorem. It *over*-suppresses (a clique gets ~0 votes, not "one vote").
+- **Fixed point (what THEORY.md proves)** → grows ~log-ish but the iteration does **not converge** past
+  the contraction limit `βλ‖K‖_∞<4` (m≳7 here) → oscillates (m=128:6.2, 256:12.5, 512:9.8). The
+  theorem is stated exactly where its own well-posedness fails.
+- **True DPP marginal** (`K=L(L+I)⁻¹`, `g_i=K_ii`) → clean **Θ(1)≈1.0**: a size-m duplicate clique
+  counts as **one effective item** — the actual clone-invariance ("one vote per cluster") you want.
+
+**Corrections forced:** drop the "Θ(log m)" and "DPP special-case" claims (our `F₂=Σa−λΣ⟨k_i,k_j⟩`
+is pairwise-inhibitory Ising, not `det(L_S)`; raw dot-product rewards *anti*-aligned pairs). The true
+DPP is the correct clone-invariant primitive. **But** even Θ(1) is a *fixed* diversity bias → it still
+discounts legitimate corroboration (the provenance-free no-free-lunch, §14.2). Beating regular
+attention requires a *context/provenance-aware* rule that decides per example whether multiplicity
+should count — the next experiment (E1), benchmarked against 2-layer attention / Set Transformer /
+attention+source-features.
