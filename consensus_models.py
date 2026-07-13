@@ -97,6 +97,58 @@ class M2ProvPool(nn.Module):
         return (w.unsqueeze(-1) * h).sum(1)
 
 
+class M2ProvXPool(nn.Module):
+    """Expressive version of the source-aware bias: learn g_i = MLP([within-neighbor same-origin
+    density, global degree, relevance]). Keeps the structural prior (a per-item gate driven by the
+    oracle-aligned density feature) but is flexible enough to recover the Bayes-optimal use of
+    provenance -> aims to keep the low-data head start AND match the flexible ceiling at high data."""
+    def __init__(self):
+        super().__init__()
+        self.q = nn.Parameter(torch.randn(DIM) * 0.02)
+        self.gate = nn.Sequential(nn.Linear(3, 16), nn.GELU(), nn.Linear(16, 1))
+
+    def forward(self, h, mask, Pgraph):
+        a = (h @ self.q) / (DIM ** 0.5)
+        sim = torch.einsum("bld,bmd->blm", h, h) / (DIM ** 0.5)
+        sim = sim.masked_fill((mask < 0.5).unsqueeze(1), float("-inf"))
+        Cw = torch.softmax(sim, dim=-1)
+        dens = (Cw * Pgraph).sum(-1)                                    # local same-origin density
+        deg = Pgraph.sum(-1) / mask.sum(1, keepdim=True).clamp_min(1)   # global degree
+        feat = torch.stack([dens, deg, a], dim=-1)                      # (B,L,3)
+        g = torch.sigmoid(self.gate(feat).squeeze(-1))
+        ex = torch.exp(a - a.amax(1, keepdim=True)) * g
+        ex = ex.masked_fill(mask < 0.5, 0.0)
+        w = ex / ex.sum(1, keepdim=True).clamp_min(1e-9)
+        return (w.unsqueeze(-1) * h).sum(1)
+
+
+class M2ProvRPool(nn.Module):
+    """Rigid prior + zero-initialized residual MLP: g_i = σ(β(τ−λ·density_i) + MLP([density,deg,a])).
+    At init MLP≈0 so it IS the rigid gate (max sample-efficiency); with data the residual adds
+    flexibility (recovers the high-data ceiling). Aims to dominate the whole learning curve."""
+    def __init__(self):
+        super().__init__()
+        self.q = nn.Parameter(torch.randn(DIM) * 0.02)
+        self.beta = nn.Parameter(torch.tensor(2.0)); self.lam = nn.Parameter(torch.tensor(2.0))
+        self.tau = nn.Parameter(torch.tensor(0.0))
+        self.gate = nn.Sequential(nn.Linear(3, 16), nn.GELU(), nn.Linear(16, 1))
+        nn.init.zeros_(self.gate[-1].weight); nn.init.zeros_(self.gate[-1].bias)   # start = rigid
+
+    def forward(self, h, mask, Pgraph):
+        a = (h @ self.q) / (DIM ** 0.5)
+        sim = torch.einsum("bld,bmd->blm", h, h) / (DIM ** 0.5)
+        sim = sim.masked_fill((mask < 0.5).unsqueeze(1), float("-inf"))
+        Cw = torch.softmax(sim, dim=-1)
+        dens = (Cw * Pgraph).sum(-1)
+        deg = Pgraph.sum(-1) / mask.sum(1, keepdim=True).clamp_min(1)
+        resid = self.gate(torch.stack([dens, deg, a], dim=-1)).squeeze(-1)
+        g = torch.sigmoid(self.beta * (self.tau - self.lam * dens) + resid)
+        ex = torch.exp(a - a.amax(1, keepdim=True)) * g
+        ex = ex.masked_fill(mask < 0.5, 0.0)
+        w = ex / ex.sum(1, keepdim=True).clamp_min(1e-9)
+        return (w.unsqueeze(-1) * h).sum(1)
+
+
 class SetTransformer(nn.Module):
     """ISAB(m_ind) + PMA(1 seed). Content-only strong baseline."""
     def __init__(self, d_in, m_ind=8):
@@ -136,7 +188,8 @@ class Model(nn.Module):
             self.net = SetTransformer(d_in)
         else:
             self.enc = Encoder(d_in + extra, use_relation_bias=(arm == "relation_bias"))
-            self.pool = M2ProvPool() if arm == "m2_prov" else SoftmaxPool()
+            self.pool = {"m2_prov": M2ProvPool, "m2_prov_x": M2ProvXPool,
+                         "m2_prov_r": M2ProvRPool}.get(arm, SoftmaxPool)()
         self.head = nn.Linear(DIM, C)
 
     def forward(self, V, mask, Pgraph):

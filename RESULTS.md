@@ -672,3 +672,34 @@ SAMPLE-EFFICIENT at consuming that signal than feeding it to generic attention �
 the bias becomes unnecessary (baselines match). NOT a raw in-distribution expressivity win.
 MVP scale, 3 seeds, one cell — full protocol (>=10 seeds + paired CIs, worst-case-over-alpha, OOD-cell
 extrapolation, latency) is the next step to lock it.
+
+### 17.1 Fixing the ceiling: the source-aware gate Pareto-DOMINATES across all data budgets
+
+The rigid m2_prov loses at high data only because its gate is 3 scalars (under-capacity), not because
+the source-aware idea is wrong. Two expressive variants (alpha=1, gamma=0.8, 3 seeds, matched params):
+- `m2_prov_x` = gate is an MLP on [within-neighbor same-origin density, degree, relevance].
+- `m2_prov_r` = **rigid gate + ZERO-INIT residual MLP** (starts exactly as m2_prov, relaxes with data).
+
+Test accuracy vs #training bags:
+
+| n_train | prov_concat | m2_prov (rigid) | m2_prov_x (MLP) | **m2_prov_r (rigid+residual)** |
+|---|---|---|---|---|
+| 200 | 52.0 | 80.2 | 53.0 | **81.8** |
+| 400 | 59.1 | 83.7 | 70.1 | **85.1** |
+| 800 | 84.4 | 87.6 | 89.1 | **91.7** |
+| 1600 | 94.0 | 89.9 | 93.6 | 94.0 |
+| 3200 | 95.4 | 91.4 | 95.1 | 95.6 |
+| 6000 | 95.9 | 92.2 | 96.2 | 95.9 |
+
+**m2_prov_r >= prov_concat at EVERY data size** — +30 pts at n=200 (where the flexible baseline is at
+chance), tapering to an exact tie at the ~96 ceiling. The zero-init residual gives the best of both:
+the rigid density prior's sample-efficiency AND the flexible ceiling. m2_prov_x confirms the ceiling
+is recoverable (96.2 >= prov_concat 95.9) but needs data to train its MLP (loses the extreme-low-data
+head start). Bias-variance is a knob; the residual dials it automatically.
+
+**Headline claim (honest, this cell, MVP scale):** content-only attention (softmax AND Set Transformer)
+is at chance (no-free-lunch); given a noisy same-source provenance signal, a source-aware pooling gate
+(rigid density prior + zero-init residual) **Pareto-dominates** a flexible provenance-attention baseline
+across the full data-budget spectrum at matched params — large gains when labels are scarce, no cost at
+scale. Answers "why lose at high data": the rigid ceiling, now fixed. Next: full protocol to lock
+(>=10 seeds + paired CIs, worst-case-over-alpha incl adaptive, OOD-cell extrapolation, latency).
