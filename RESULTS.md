@@ -703,3 +703,53 @@ is at chance (no-free-lunch); given a noisy same-source provenance signal, a sou
 across the full data-budget spectrum at matched params — large gains when labels are scarce, no cost at
 scale. Answers "why lose at high data": the rigid ceiling, now fixed. Next: full protocol to lock
 (>=10 seeds + paired CIs, worst-case-over-alpha incl adaptive, OOD-cell extrapolation, latency).
+
+## 18. E1c — FULL PROTOCOL (10 seeds, paired CIs, pre-registered): the locked result
+
+Pre-registration in `PREREG.md` (primary = balanced test acc @ alpha=1, gamma=0.8; frozen test seed
+777; H1-H4 + kill criteria). Non-gameability gate PASSES (item-maj 50.2, surf-cnt 50.2, oracle 98.2).
+Arms: shared k=1 attn encoder + swappable head, matched params (within 0.2%). `bench_full.py` +
+`aggregate.py`, 10 seeds.
+
+**H1 no-free-lunch — CONFIRMED.** Content-only at/below chance at every size: softmax 48.6->50.2,
+set_transformer 35->49. Regular attention (and Set Transformer) cannot beat chance.
+
+**H2 low-data win — CONFIRMED (parity at scale).** Learning curve (test acc, mean±std):
+
+| arm | n=200 | n=400 | n=800 | n=1600 | n=3200 | n=6000 |
+|---|---|---|---|---|---|---|
+| softmax | 48.6 | 48.9 | 49.9 | 49.5 | 49.5 | 50.2 |
+| set_transformer | 35.1 | 39.8 | 43.7 | 45.8 | 47.6 | 49.1 |
+| prov_concat | 52.2 | 60.6 | 85.1 | 94.4 | 95.5 | 95.7 |
+| relation_bias | 45.0 | 47.1 | 51.3 | 79.8 | 92.4 | 94.3 |
+| m2_prov (rigid) | 80.6 | 84.6 | 87.6 | 90.0 | 91.6 | 92.9 |
+| m2_prov_x (MLP) | 54.3 | 70.9 | 87.7 | 93.6 | 94.9 | 96.2 |
+| **m2_prov_r (ours)** | **81.8** | **85.3** | **91.4** | 93.7 | 95.5 | 95.8 |
+
+paired Δ(m2_prov_r − prov_concat), 95% bootstrap CI: n=200 +29.6 [28.5,30.7]; n=400 +24.7 [23.0,26.5];
+n=800 +6.3 [3.6,8.7] (all wins); n=1600 −0.6 [−1.0,−0.1] (baseline +0.6, marginal); n=3200 −0.0; n=6000
++0.1 (ties). => large win when labels scarce, parity at the ceiling, one negligible 0.6-pt dip.
+
+**H3 robustness (worst-case-over-alpha = adaptive adversary, n=800) — CLEAN WIN:**
+
+| arm | α=0.5 | α=1 | α=2 | worst |
+|---|---|---|---|---|
+| softmax | 81.1 | 49.9 | 97.0 | 49.9 |
+| prov_concat | 86.3 | 85.1 | 96.8 | 85.1 |
+| relation_bias | 82.9 | 51.3 | 96.6 | 51.3 |
+| **m2_prov_r** | 89.0 | 91.4 | 96.6 | **89.0** |
+
+m2_prov_r worst-case (89.0) beats regular attention (49.9), cheap prov-concat (85.1), and relation-bias
+(collapses to 51.3 at the hard slice). Most robust to the adaptive adversary.
+
+**H4 OOD (train n_orig[3,6] -> test [8,10]):** tie/non-differentiating (shift makes it easier; all
+~98-99.7; m2_prov_r 99.7 = prov_concat 99.7).
+
+**Latency @ L=64:** m2_prov_r +84 params (0.2%), ~1.7x fwd, fwd+bwd comparable.
+
+**LOCKED VERDICT:** content-only attention is at chance (no-free-lunch); given a noisy same-source
+provenance signal, our source-aware gate (rigid density prior + zero-init residual) is (i) far more
+SAMPLE-EFFICIENT (paired-CI win, +6 to +30 pts at n<=800), (ii) at parity at scale, and (iii) the MOST
+ROBUST to an adaptive adversary (worst-case-over-alpha 89.0 vs <=85.1), at matched params and ~1.7x
+fwd cost. Honestly scoped: not a raw high-data expressivity win; the contribution is inductive bias +
+robustness for consuming provenance. (MVP model scale; single task family.)
