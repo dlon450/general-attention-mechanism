@@ -604,3 +604,27 @@ discounts legitimate corroboration (the provenance-free no-free-lunch, §14.2). 
 attention requires a *context/provenance-aware* rule that decides per example whether multiplicity
 should count — the next experiment (E1), benchmarked against 2-layer attention / Set Transformer /
 attention+source-features.
+
+## 16. E1a — the consensus benchmark is validated (non-gameable + provenance window found)
+
+`task_consensus.py`: binary latent truth; two content clusters MATCHED in #items, #distinct
+surface-ids, and per-item content spread (exchangeable in (V,S)), differing ONLY in true-origin
+structure (honest = n independent origins; Sybil = 1 origin relabeled across n surface-ids), revealed
+via a NOISY same-origin graph (edge accuracy γ). α = Sybil/honest content spread.
+
+Gameability + window probe (3000 ex/cell, binary chance = 50%):
+
+| slice | item-maj | surf-count | oracle (provenance, robust) |
+|---|---|---|---|
+| **α=1, γ=1.0** | 49.6 | 49.6 | 100.0 |
+| **α=1, γ=0.8** | 49.7 | 49.7 | 98.3 |
+| **α=1, γ=0.7** | 48.9 | 48.9 | 94.2 |
+| **α=1, γ=0.6** | 48.6 | 48.6 | 84.4 |
+| α=0.5, γ=0.8 | 38.1 | 38.1 | 98.4 |
+| α=2.0, γ=0.8 | 81.0 | 81.0 | 95.2 |
+
+**α=1 is the swap-symmetric hard slice**: content/count baselines sit at chance, and only the
+provenance channel separates truth — the empirical no-free-lunch for any (V,S)-only reader. The
+robust oracle (within-cluster mean of the noisy graph, which averages out edge noise) is near-perfect
+and graceful in γ. Headline cell for the mechanism study: **α=1, γ=0.8** (oracle 98%, clearly
+non-trivial noise, cheap = chance). This validates the testbed before building mechanisms/baselines.
