@@ -2,11 +2,15 @@
 """
 Train a lightweight ViT on CIFAR-10/100 with either:
   - Regular multi-head self-attention (MHA), or
-  - General subset attention from general_attention.py
+  - General subset attention from general_attention.py, or
+  - Deterministic gated-softmax attention from gated_attention.py, or
+  - Stochastic Gumbel-softmax attention from stochastic_attention.py
 
 Example:
   python train_vit_cifar.py --dataset cifar10 --attention mha --download
   python train_vit_cifar.py --dataset cifar10 --attention general --download
+  python train_vit_cifar.py --dataset cifar10 --attention gumbel --gumbel-tau 0.5 --download
+  python train_vit_cifar.py --dataset cifar10 --attention gumbel_topk --gumbel-topk 4 --download
 """
 from __future__ import annotations
 
@@ -17,7 +21,7 @@ import random
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 import torch.nn as nn
@@ -25,6 +29,7 @@ from torch.utils.data import DataLoader
 
 from general_attention import GeneralAttention, GibbsConfig
 from gated_attention import GatedSoftmaxAttention
+from stochastic_attention import GumbelSoftmaxAttention
 
 
 CIFAR_MEAN = (0.4914, 0.4822, 0.4465)
@@ -213,11 +218,23 @@ class TransformerBlock(nn.Module):
         gated_beta_init: float = 0.0,
         gated_repulsion: bool = False,
         gated_lambda_init: float = 0.0,
+        gumbel_tau: float = 1.0,
+        gumbel_topk: int = 1,
+        gumbel_hard: bool = True,
     ):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         if attention_type == "mha":
             self.attn = MHASelfAttention(dim, num_heads, attn_dropout, dropout)
+        elif attention_type in ("gumbel", "gumbel_topk"):
+            self.attn = GumbelSoftmaxAttention(
+                dim,
+                num_heads,
+                proj_dropout=dropout,
+                topk=gumbel_topk if attention_type == "gumbel_topk" else None,
+                tau=gumbel_tau,
+                hard=gumbel_hard,
+            )
         elif attention_type == "gated":
             self.attn = GatedSoftmaxAttention(
                 dim,
@@ -285,6 +302,9 @@ class TinyViT(nn.Module):
         gated_beta_init: float = 0.0,
         gated_repulsion: bool = False,
         gated_lambda_init: float = 0.0,
+        gumbel_tau: float = 1.0,
+        gumbel_topk: int = 1,
+        gumbel_hard: bool = True,
     ):
         super().__init__()
         self.patch_embed = PatchEmbed(
@@ -322,6 +342,9 @@ class TinyViT(nn.Module):
                     gated_beta_init=gated_beta_init,
                     gated_repulsion=gated_repulsion,
                     gated_lambda_init=gated_lambda_init,
+                    gumbel_tau=gumbel_tau,
+                    gumbel_topk=gumbel_topk,
+                    gumbel_hard=gumbel_hard,
                 )
                 for _ in range(depth)
             ]
@@ -485,6 +508,7 @@ class EpochMetrics:
     lr: float
     epoch_seconds: float
     images_per_sec: float
+    gumbel_tau: Optional[float] = None  # None unless --attention gumbel/gumbel_topk
 
 
 def accuracy(logits: torch.Tensor, targets: torch.Tensor) -> float:
@@ -503,6 +527,18 @@ def count_trainable_params(model: nn.Module) -> int:
     return int(total)
 
 
+def set_gumbel_tau(model: nn.Module, tau: float) -> None:
+    """Set the Gumbel-softmax temperature on every stochastic attention module.
+
+    ``GumbelSoftmaxAttention`` reads ``self.gumbel_tau`` at forward time, so writing the
+    attribute is all an annealing schedule has to do. The value written by the last
+    training step of an epoch is also the one the following ``evaluate()`` pass uses.
+    """
+    for m in model.modules():
+        if isinstance(m, GumbelSoftmaxAttention):
+            m.gumbel_tau = tau
+
+
 def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -516,6 +552,7 @@ def train_one_epoch(
     epoch: int,
     total_epochs: int,
     log_every_batches: int,
+    tau_schedule: Optional[Callable[[int], float]] = None,
 ) -> tuple[float, float, float]:
     model.train()
     total_loss = 0.0
@@ -534,6 +571,9 @@ def train_one_epoch(
             first_batch_wait = time.perf_counter() - first_batch_wait_start
             log(f"[train] epoch {epoch}/{total_epochs}: first batch loaded after {first_batch_wait:.2f}s")
         step_start = time.perf_counter()
+        if tau_schedule is not None:
+            # Global step, so the anneal is continuous across epoch boundaries.
+            set_gumbel_tau(model, tau_schedule((epoch - 1) * n_batches + (step - 1)))
         images = images.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
         bsz = images.shape[0]
@@ -658,6 +698,35 @@ def build_scheduler(
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
 
+def build_tau_schedule(
+    tau_start: float,
+    end_ratio: float,
+    total_steps: int,
+) -> Callable[[int], float]:
+    r"""Exponential Gumbel temperature anneal, as in Jang et al. (2017).
+
+    ``tau(t) = tau_start * end_ratio ** (t / (total_steps - 1))``, i.e. the usual
+    ``tau_start * exp(-r t)`` with rate ``r = -log(end_ratio) / (total_steps - 1)``. The
+    temperature starts at ``tau_start`` and hits ``tau_start * end_ratio`` exactly on the
+    last training step; ``end_ratio == 1.0`` gives a constant temperature (no annealing).
+
+    ``t`` is a global step counter, so the anneal is unaffected by where epochs fall, and
+    it runs over the whole schedule -- unlike the learning rate, it is not held back
+    during the LR warmup.
+    """
+    if not 0.0 < end_ratio <= 1.0:
+        raise ValueError(f"--gumbel-tau-end-ratio must be in (0, 1], got {end_ratio}")
+    if tau_start <= 0.0:
+        raise ValueError(f"--gumbel-tau must be > 0, got {tau_start}")
+    last_step = max(1, total_steps - 1)
+
+    def tau_at(step: int) -> float:
+        progress = min(max(float(step) / last_step, 0.0), 1.0)
+        return tau_start * (end_ratio**progress)
+
+    return tau_at
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -670,7 +739,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-dir", type=Path, default=Path("./data"))
     parser.add_argument("--download", action="store_true")
 
-    parser.add_argument("--attention", choices=["mha", "general", "gated"], default="general")
+    parser.add_argument(
+        "--attention",
+        choices=["mha", "general", "gated", "gumbel", "gumbel_topk"],
+        default="general",
+    )
     parser.add_argument(
         "--gated-beta-init",
         type=float,
@@ -694,6 +767,41 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Initial repulsion strength lambda for --gated-repulsion. 0.0 starts it ~off "
             "(may stay off); use a positive value (e.g. 1.0) to make repulsion active from step 0."
+        ),
+    )
+    parser.add_argument(
+        "--gumbel-tau",
+        type=float,
+        default=1.0,
+        help=(
+            "Gumbel-softmax relaxation temperature for --attention gumbel/gumbel_topk. "
+            "Lower is sharper."
+        ),
+    )
+    parser.add_argument(
+        "--gumbel-topk",
+        type=int,
+        default=1,
+        help=(
+            "Keys kept per query row for --attention gumbel_topk, each given mass 1/k. "
+            "Clamped to the sequence length. Ignored by --attention gumbel."
+        ),
+    )
+    parser.add_argument(
+        "--gumbel-soft",
+        action="store_true",
+        help=(
+            "Use the relaxed Gumbel-softmax weights directly instead of the hard "
+            "straight-through selection (--attention gumbel/gumbel_topk)."
+        ),
+    )
+    parser.add_argument(
+        "--gumbel-tau-end-ratio",
+        type=float,
+        default=1.0,
+        help=(
+            "Anneal tau exponentially from --gumbel-tau to this fraction of it over the "
+            "run (Jang et al., 2017), on a global step counter. 1.0 (default) = no anneal."
         ),
     )
     parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto")
@@ -888,6 +996,9 @@ def main() -> None:
         gated_beta_init=args.gated_beta_init,
         gated_repulsion=args.gated_repulsion,
         gated_lambda_init=args.gated_lambda_init,
+        gumbel_tau=args.gumbel_tau,
+        gumbel_topk=args.gumbel_topk,
+        gumbel_hard=not args.gumbel_soft,
     ).to(device)
     log("[setup] model built and moved to device")
 
@@ -926,6 +1037,32 @@ def main() -> None:
         ):
             log("[setup] exact_attention_special_case=True")
 
+    # Gumbel temperature anneal. Built for the no-anneal case too (end_ratio=1.0 gives a
+    # constant function) so the effective tau is reported the same way in both cases.
+    tau_schedule: Optional[Callable[[int], float]] = None
+    if args.attention in ("gumbel", "gumbel_topk"):
+        if args.attn_dropout > 0:
+            log(
+                f"[setup] WARNING: --attn-dropout {args.attn_dropout} is ignored by "
+                f"--attention {args.attention} (the sampling is the stochasticity)"
+            )
+        tau_schedule = build_tau_schedule(
+            tau_start=args.gumbel_tau,
+            end_ratio=args.gumbel_tau_end_ratio,
+            total_steps=max(1, len(train_loader) * args.epochs),
+        )
+        anneal = (
+            "off (constant tau)"
+            if args.gumbel_tau_end_ratio == 1.0
+            else f"exponential to {args.gumbel_tau * args.gumbel_tau_end_ratio:g}"
+        )
+        log(
+            "gumbel attention config:"
+            f" tau={args.gumbel_tau}, hard={not args.gumbel_soft}"
+            + (f", topk={args.gumbel_topk}" if args.attention == "gumbel_topk" else "")
+            + f", anneal={anneal}"
+        )
+
     metrics: list[EpochMetrics] = []
     best_val = -1.0
     best_epoch = -1
@@ -954,6 +1091,7 @@ def main() -> None:
             epoch=epoch,
             total_epochs=args.epochs,
             log_every_batches=args.log_every_batches,
+            tau_schedule=tau_schedule,
         )
         val_loss, val_acc = evaluate(
             model=model,
@@ -966,6 +1104,10 @@ def main() -> None:
         )
         current_lr = optimizer.param_groups[0]["lr"]
         imgs_sec = (len(train_loader) * args.batch_size) / max(epoch_seconds, 1e-9)
+        # tau at the epoch's last training step -- the value the eval pass above also used.
+        current_tau = (
+            tau_schedule(epoch * len(train_loader) - 1) if tau_schedule is not None else None
+        )
         rec = EpochMetrics(
             epoch=epoch,
             train_loss=train_loss,
@@ -975,6 +1117,7 @@ def main() -> None:
             lr=current_lr,
             epoch_seconds=epoch_seconds,
             images_per_sec=imgs_sec,
+            gumbel_tau=current_tau,
         )
         metrics.append(rec)
 
@@ -987,6 +1130,7 @@ def main() -> None:
             f"train_loss={train_loss:.4f} train_acc={train_acc:.2f}% "
             f"val_loss={val_loss:.4f} val_acc={val_acc:.2f}% "
             f"lr={current_lr:.3e} imgs/s={imgs_sec:.1f}"
+            + (f" tau={current_tau:.4f}" if current_tau is not None else "")
         )
 
         if args.checkpoint_every > 0 and epoch % args.checkpoint_every == 0:
